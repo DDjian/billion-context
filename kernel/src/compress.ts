@@ -896,6 +896,7 @@ const assignRefsNode: PipelineNode = {
     const hasProtection =
       ctx.config.protectedTools.length > 0 ||
       !!ctx.config.isToolProtected ||
+      !!ctx.config.isMessageProtected ||
       (ctx.config.protectedLatestTools?.length ?? 0) > 0;
     const latest = hasProtection
       ? collectLatestProtected(io.messages, ctx.config)
