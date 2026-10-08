@@ -14,6 +14,7 @@ import { codexAlignedWindow } from "../codex-models.js";
 import { MAX_REQUEST_BYTES } from "../fetch-util.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
+import { durableMessageGuards } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -1722,6 +1723,12 @@ export async function handle(
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
         // render from the values the kernel actually used this turn.
+        // #2419: per-lane durable-state message guard — attach BEFORE stamping
+        // so both this turn's processTurn(reqConfig) and the stamped effective
+        // config (read by /__bili/plugin/tool) carry it. Only lanes present in
+        // the registry are affected; an absent predicate is byte-identical.
+        const durableGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
+        if (durableGuard !== undefined) reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
         storeEffectiveConfig(session, reqConfig);
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
