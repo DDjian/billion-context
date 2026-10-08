@@ -1723,13 +1723,15 @@ export async function handle(
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
         // render from the values the kernel actually used this turn.
-        // #2419: per-lane durable-state message guard — attach BEFORE stamping
-        // so both this turn's processTurn(reqConfig) and the stamped effective
-        // config (read by /__bili/plugin/tool) carry it. Only lanes present in
-        // the registry are affected; an absent predicate is byte-identical.
+        // #2419: per-lane durable-state message guard (KDD#9 evidence-permitlist).
+        // Stamp the CLONE-SAFE config first — a function inside
+        // session.metadata.effectiveConfig would break fork-adoption structuredClone
+        // and disk persistence — then attach it to this turn's reqConfig so
+        // processTurn protects the message now. effectiveConfig() re-resolves the
+        // guard from the lane id at read time, so /__bili/plugin/tool sees it too.
+        storeEffectiveConfig(session, reqConfig);
         const durableGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
         if (durableGuard !== undefined) reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
-        storeEffectiveConfig(session, reqConfig);
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.

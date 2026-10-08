@@ -20,7 +20,7 @@
 
 import type { CoreMessage } from "acp-kernel";
 
-export type DurableMessageGuard = (msg: CoreMessage) => boolean;
+type DurableMessageGuard = (msg: CoreMessage) => boolean;
 
 /** dsh skill-catalog guard (#2419): matches the durable catalog message
  *  injected by dsh-tool-skill (a \x3csystem-reminder\x3e carrying the
