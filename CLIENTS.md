@@ -80,14 +80,25 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
- - **Web-profile caveat (#1772):** when a profile's bundles include
-   `@deepseek-ai/dsh-web-app`, the running `compaction-basic` instance lives
-   inside an agent preset (`preset-standard.config.plugins`) that no patch
-   layer can reach by id — dsh's patch engine indexes only top-level rows and
-   true group children — so the bundled `auto: false` lands on web-app's
-   already-disabled host-plane row and the preset instance keeps
-   auto-compaction ON. The plugin logs a one-time `[dsh-client]` warning at
-   boot in such profiles; ACP compression is unaffected.
+ - **Web-profile caveat (#1772, corrected by #2474):** when a profile's
+   bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
+   instance lives inside an agent preset (`preset-standard.config.plugins`).
+   No patch layer can address that NESTED row by id — dsh's patch engine
+   indexes only top-level rows and true group children — so the bundled
+   `auto: false` lands on web-app's already-disabled host-plane row and the
+   preset instance keeps auto-compaction ON. But `preset-standard` itself is
+   an ordinary bundle-layer entry: a profile-level patch (your profile's
+   `cordis.patch.yml`, applied after every bundle) overrides it by id with a
+   FULL-SNAPSHOT `config` — copy the complete preset config from
+   `dsh --profile <name> --dump-config`, add `config.auto: false` under its
+   `compaction-basic` row, append the result to `cordis.patch.yml`. Config
+   replacement is WHOLESALE: a partial snippet silently drops everything not
+   restated — including the preset's own `id`/`order` identity, which can
+   leave the preset unrecognized by the roster — and `- insert:` with the
+   same id appends a second dead row instead of merging. The snapshot also
+   freezes the roster until re-copied after a dsh preset update. The plugin
+   logs a one-time `[dsh-client]` warning naming this recipe at boot in such
+   profiles; ACP compression is unaffected.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like

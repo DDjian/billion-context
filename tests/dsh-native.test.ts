@@ -805,6 +805,13 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(ctx);
             assert.equal(warnLines().length, 1);
             assert.match(warnLines()[0], /#1772/);
+            // #2474: the caveat must point at the working exit (full-snapshot
+            // override of preset-standard via cordis.patch.yml), not end in a
+            // dead end — pin the pointer so the correction can't regress.
+            assert.match(warnLines()[0], /#2474/);
+            assert.match(warnLines()[0], /cordis\.patch\.yml/);
+            assert.match(warnLines()[0], /WHOLESALE/);
+            assert.match(warnLines()[0], /insert:/);
             // #1791: settle each apply's attach chain while the mock is still
             // open — a deferred probe settling against a closed mock runs the
             // spawn fallback mid-way through a LATER test and clobbers the

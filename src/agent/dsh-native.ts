@@ -1217,12 +1217,18 @@ export function apply(ctx: PluginContext): void {
         refreshModelInfo(register.base ?? state.origin);
     }
 
-    // #1772: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
+    // #1772/#2474: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
     // compaction-basic instance sits inside an agent preset (preset-standard's
-    // config.plugins), which no patch layer can reach by id — the bundled
-    // `auto: false` lands on web-app's already-disabled host-plane row and the
-    // preset instance keeps auto-compaction ON. Surface it once through the
-    // durable channel (GUI hosts swallow stderr); ACP compression is unaffected.
+    // config.plugins). No patch layer can address that NESTED row by id — the
+    // engine indexes top-level rows only — so the bundled `auto: false` lands
+    // on web-app's already-disabled host-plane row and the preset instance
+    // keeps auto-compaction ON. #2474 corrected the earlier "unreachable"
+    // conclusion: preset-standard itself is an ordinary bundle-layer entry,
+    // and a profile-layer patch (applied after every bundle) can replace its
+    // config WHOLESALE with a full snapshot carrying auto:false — so the
+    // warning names that recipe instead of ending in a dead end. Surface it
+    // once through the durable channel (GUI hosts swallow stderr); ACP
+    // compression is unaffected.
     if (!webProfileWarned) {
         let bundles: readonly string[] | undefined;
         try {
@@ -1238,7 +1244,7 @@ export function apply(ctx: PluginContext): void {
         }
         if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
             webProfileWarned = true;
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false (#1772); dsh native auto-compaction stays enabled in this profile (ACP compression unaffected)");
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false by id (#1772); dsh native auto-compaction stays enabled in this profile (ACP compression unaffected). To switch it off (#2474): append to your profile's cordis.patch.yml a FULL-SNAPSHOT override of the preset-standard entry (- id: preset-standard + the complete config copied from 'dsh --profile <name> --dump-config', plus config.auto: false under its compaction-basic row) — the patch engine replaces a matched row's config WHOLESALE, so a partial snippet silently drops everything you did not restate (the other plugins AND the preset's id/order identity), and - insert: with the same id appends a dead duplicate row instead of merging; the snapshot also freezes the roster until you re-copy it after a dsh preset update");
         }
     }
 
