@@ -210,6 +210,39 @@ test("proxy precedence, NO_PROXY, HTTPS proxies and self-loop detection are dete
     assert.equal(parseHttpProxy("https://proxy.example:9443")?.protocol, "https:");
 });
 
+test("Windows ProxyOverride mid-token wildcards bypass the system proxy (#2502)", () => {
+    const clashDefault = "localhost;127.*;192.168.*;10.*;172.16.*;172.31.*;<local>";
+    assert.equal(matchesNoProxy(new URL("http://127.0.0.1:8893"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://192.168.1.5:11434"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://10.0.0.9"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://172.31.9.9"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://localhost:8893"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://myhost:80"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://api.openai.com/v1"), clashDefault, { windowsBypass: true }), false);
+    // literal-dot boundary: 127.* requires the actual dot (127abc.example must not match)
+    assert.equal(matchesNoProxy(new URL("http://127abc.example/"), clashDefault, { windowsBypass: true }), false);
+    // existing grammar stays intact under the flag: *.suffix (incl. apex), <local>, exact
+    assert.equal(matchesNoProxy(new URL("https://sub.example.com"), "*.example.com", { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("https://example.com"), "*.example.com", { windowsBypass: true }), true);
+    // NO_PROXY grammar unchanged: a mid-token * is not a wildcard there
+    assert.equal(matchesNoProxy(new URL("http://127.0.0.1:8893"), "127.*"), false);
+    assert.equal(matchesNoProxy(new URL("http://127.0.0.1:8893"), "127.*", {}), false);
+    // decision level: loopback upstream with Clash's default list goes windows-bypass,
+    // public upstream still rides the system proxy
+    assert.deepEqual(resolveProxyDecision({}, undefined, "http://127.0.0.1:8893/v1", {
+        systemProxy: { enabled: true, http: "http://127.0.0.1:7897", bypass: clashDefault },
+        biliPort: 8787,
+    }), { source: "windows-bypass" });
+    assert.deepEqual(resolveProxyDecision({}, undefined, "http://192.168.1.5:11434/api", {
+        systemProxy: { enabled: true, http: "http://127.0.0.1:7897", bypass: clashDefault },
+        biliPort: 8787,
+    }), { source: "windows-bypass" });
+    assert.deepEqual(resolveProxyDecision({}, undefined, "https://api.openai.com/v1", {
+        systemProxy: { enabled: true, https: "http://127.0.0.1:7897", bypass: clashDefault },
+        biliPort: 8787,
+    }), { proxy: "http://127.0.0.1:7897/", source: "windows-system" });
+});
+
 test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", () => {
     const opts = loadOptions({
         ACP_PORT: "9100",
