@@ -310,16 +310,17 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
-    /** Force preflight summarization calls to use streaming (SSE) instead of
-     *  the default non-stream call (#2133). The error-driven self-learn flag
-     *  (`session.metadata.preflightStreamSummary`) only fires on a 400 whose
-     *  body says "stream … true" — a gateway that cuts long non-streaming
-     *  completions with a timeout status (Cloudflare's HTTP 524 is the
-     *  canonical case) never triggers it, so every summary round-trip fails
-     *  and preflight spins without folding until an operator hand-edits the
-     *  session file. Set this where such a gateway sits between bili and the
-     *  origin: every preflight summary call then streams from the first
-     *  attempt. Deepest level wins (global → provider → model), so it can be
+     /** Force preflight summarization calls to use streaming (SSE) instead of
+      *  the default non-stream call (#2133). The error-driven self-learn flag
+      *  (`session.metadata.preflightStreamSummary`) fires on any 400 from a
+      *  NON-STREAMING summary attempt (#2494: the shape is the detector —
+      *  originally only "stream … true" wording was recognized) and on a
+      *  first-hit gateway timeout (Cloudflare's HTTP 524 / 504), so most
+      *  stream-mandating upstreams now self-heal in one round-trip. Set this
+      *  where a gateway cuts long non-streaming completions with a status the
+      *  learn path cannot see, or simply to skip the one probe round-trip —
+      *  every preflight summary call then streams from the first attempt.
+      *  Deepest level wins (global → provider → model), so it can be
      *  scoped to just the affected route; unset = legacy behavior (non-stream
      *  first, learn on 400). No-op on the Google wire (its summary calls are
      *  always streamed via :streamGenerateContent). */

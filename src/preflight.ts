@@ -480,9 +480,13 @@ export function summaryPayload(protocol: PreflightProtocol, model: string, syste
 }
 
 // #626: some upstreams (ChatGPT-login codex backend) reject non-stream calls
-// outright with 400 "Stream must be set to true". Match the rejection broadly
-// enough to cover phrasing variants, narrowly enough that an unrelated 400
-// mentioning neither word never triggers a pointless stream retry.
+// outright with 400 "Stream must be set to true". #2494: no phrase list can
+// enumerate every vendor's wording for the same policy ("Non-stream chat
+// request is currently not supported", code 11101, defeats the original
+// regex), so the regex no longer GATES the adaptation — a 400 on a
+// NON-STREAMING summary call is itself the signal (the shape was rejected)
+// and gets exactly one SSE probe. The regex survives only to pick the more
+// specific log line.
 const STREAM_REQUIRED_RE = /\bstream\b[^\n]{0,60}\btrue\b/i;
 
 // #663: the same ChatGPT-login codex backend rejects the Responses
@@ -895,10 +899,13 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // most once (guarded below), so the compatibility retries are bounded:
     // at most one extra attempt per capability, in either rejection order.
     // #2133: compress.streamSummary forces SSE from the first attempt — the
-    // learn path above only sees 400 "stream required" rejections, which a
-    // gateway timeout (524) never produces. #2155: an explicit cascade FALSE
-    // (streamSummaryOff) opts the request out of SSE summaries entirely — both
-    // learn paths stay disarmed and a stale learned flag is ignored.
+    // learn path below only sees 400 rejections of a NON-STREAMING attempt
+    // (#2494: any wording; originally just "stream … true") plus the 524/504
+    // first-hit timeout, which a gateway that cuts long non-streaming
+    // completions with a timeout status never produces as a 400. #2155: an
+    // explicit cascade FALSE (streamSummaryOff) opts the request out of SSE
+    // summaries entirely — all learn paths stay disarmed and a stale learned
+    // flag is ignored.
     let stream = !deps.streamSummaryOff && (deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true);
     let includeMaxOutputTokens = !(deps.protocol === "responses" && hasLearnedNoMaxOutputTokens(deps));
     for (;;) {
@@ -918,13 +925,25 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
             }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
-                if (!stream && !deps.streamSummaryOff && STREAM_REQUIRED_RE.test(err.body)) {
+                const paramRejected = deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body);
+                // #2494: probe on ANY wording (see STREAM_REQUIRED_RE note) —
+                // except when the 400 has an identified specific cause (the
+                // max_output_tokens parameter below): then the correct
+                // single-variable adaptation is dropping the param and keeping
+                // the transport, and if the upstream ALSO mandates streaming
+                // its next 400 triggers the probe. Also excluded: the Google
+                // wire, whose summary payload carries no stream field
+                // (:streamGenerateContent always streams), so the probe would
+                // only repeat the identical request.
+                if (!stream && !deps.streamSummaryOff && deps.protocol !== "google" && !paramRejected) {
                     deps.session.metadata.preflightStreamSummary = true;
                     stream = true;
                     adapted = true;
-                    deps.log("info", "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)");
+                    deps.log("info", STREAM_REQUIRED_RE.test(err.body)
+                        ? "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)"
+                        : "[preflight] non-streaming summary rejected with HTTP 400; probing once with SSE — upstream likely requires streaming (learned for this session, #2494)");
                 }
-                if (deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body)) {
+                if (paramRejected) {
                     rememberNoMaxOutputTokens(deps);
                     includeMaxOutputTokens = false;
                     adapted = true;
