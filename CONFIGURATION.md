@@ -154,13 +154,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC sweep interval. |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Size cap for fork-API public snapshots served to native plugins. |
-
-**Abuse audit lane (#2504)**
-
-| Key | Type | Default | Env | Description |
-|-----|------|---------|-----|-------------|
-| `audit` | object | {} (all defaults) | — | Operator-side forensic inspection of persisted session material. Every switch defaults OFF; nothing in this block ever alters request behavior. |
-| `audit.offline.enabled` | boolean | false | BILI_AUDIT_OFFLINE_ENABLED | Switch A: metrics-only offline re-review of persisted session files. Boot scan + loopback admin readout; counts only — no alerts, no model calls, no content leaves the sessions dir. |
+| `audit.offline.enabled` | boolean | false | BILI_AUDIT_OFFLINE_ENABLED | Switch A of the abuse-audit lane (#2504): metrics-only offline re-review of persisted session files. Boot scan plus loopback admin readout; counts only - no alerts, no model calls, no content leaves the sessions dir. |
 
 **Updates & advisories**
 
@@ -1609,6 +1603,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
+| `BILI_AUDIT_OFFLINE_ENABLED` | `audit.offline.enabled` | false |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
@@ -1621,7 +1616,6 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | 3600000 (0 disables the log) |
 | `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
-| `BILI_AUDIT_OFFLINE_ENABLED` | `audit.offline.enabled` | false |
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
 | `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
 | `BILI_FORK_ADOPTION` | `forkAdoption` | false |

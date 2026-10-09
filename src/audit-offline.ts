@@ -24,7 +24,7 @@ import { isValidRecord } from "./persist.js";
 import { contentStoreTokens } from "./session-gc.js";
 import { persistZstdEnabled } from "./knobs.js";
 
-export interface AuditOfflineFileStats {
+interface AuditOfflineFileStats {
     /** Path relative to the sessions dir (hash-named; never absolute). */
     file: string;
     readable: boolean;

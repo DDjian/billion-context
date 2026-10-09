@@ -154,13 +154,7 @@
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
-
-**滥用审计通道 (#2504)**
-
-| Key | Type | Default | Env | Description |
-|-----|------|---------|-----|-------------|
-| `audit` | object | {}（全默认） | — | 运维侧对已持久化会话材料的取证检查。本块内所有开关默认 OFF，任何一项都不改变请求行为。 |
-| `audit.offline.enabled` | boolean | false | BILI_AUDIT_OFFLINE_ENABLED | 开关 A：对已持久化会话文件做仅计数的离线复查。启动时扫描 + loopback 管理端点读取；只报计数——无告警、无模型调用、内容不离开 sessions 目录。 |
+| `audit.offline.enabled` | boolean | false | BILI_AUDIT_OFFLINE_ENABLED | 滥用审计通道（#2504）开关 A：对已持久化会话文件做仅计数的离线复查。启动时扫描加 loopback 管理端点读取；只报计数——无告警、无模型调用、内容不离开 sessions 目录。 |
 
 **更新与公告**
 
@@ -1608,6 +1602,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
+| `BILI_AUDIT_OFFLINE_ENABLED` | `audit.offline.enabled` | false |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
@@ -1620,7 +1615,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | 3600000 (0 disables the log) |
 | `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
-| `BILI_AUDIT_OFFLINE_ENABLED` | `audit.offline.enabled` | false |
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
 | `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
 | `BILI_FORK_ADOPTION` | `forkAdoption` | false |
