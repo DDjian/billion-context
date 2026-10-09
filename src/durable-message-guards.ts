@@ -10,7 +10,9 @@
 // contents — changes), and the agent-loop runtime-context snapshot (#2481:
 // sandbox/approval policy state, self-declared "supersedes earlier
 // runtime-context snapshots" — resent only when the runtime context CHANGES,
-// not every turn). ACP compression treats every history message as consumable,
+// not every turn) — plus a FOURTH carrier from the dsh PLUGIN ecosystem
+// (#2446: dsh-skill-mcp-manager's \x3cmcp_catalog\x3e block, the first guard
+// entry whose emitter is not dsh core). ACP compression treats every history message as consumable,
 // so one fold of any carrier silently kills its guidance forever (the host
 // will not resend what it believes is already present). The structured
 // source.kind these hosts stamp internally never reaches the proxy wire
@@ -63,6 +65,23 @@ export function dshWorkspaceInstructionsGuard(msg: CoreMessage): boolean {
     return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:");
 }
 
+/** dsh mcp-catalog guard (#2446): matches the durable MCP-server catalog
+ *  injected by the THIRD-PARTY plugin dsh-skill-mcp-manager (author-reported
+ *  marker; the plugin also curates which skills the dsh core catalog offers).
+ *  The catalog rides a user-role message whose \x3cmcp_catalog\x3e block lists
+ *  every registered MCP server with tool-schema digests (~5K tokens in the
+ *  report); the plugin re-emits it only when the visible MCP/skill set
+ *  CHANGES, so one fold silently kills the session's MCP server inventory
+ *  forever — the report's failure mode is the model hunting for servers by
+ *  wrong names mid-session. First guard entry for a carrier emitted by the
+ *  dsh plugin ecosystem rather than dsh core: same evidence bar (shape from
+ *  the #2446 report, stability owned by the plugin author who filed it),
+ *  marker-over-wrapper rationale as #2419, and re-emissions are rare set
+ *  changes so pinning every match stays bounded (same argument as #2447). */
+export function dshMcpCatalogGuard(msg: CoreMessage): boolean {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cmcp_catalog\x3e");
+}
+
 /** dsh runtime-context guard (#2481): matches the durable runtime-context
  *  snapshot injected by the dsh agent loop — sandbox/approval policy state
  *  carried as a user-role message containing "Current runtime context"
@@ -88,5 +107,5 @@ export function dshRuntimeContextGuard(msg: CoreMessage): boolean {
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
 export const durableMessageGuards: Record<string, DurableMessageGuard> = {
     dsh: (msg) =>
-        dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg) || dshRuntimeContextGuard(msg),
+        dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg) || dshRuntimeContextGuard(msg) || dshMcpCatalogGuard(msg),
 };
