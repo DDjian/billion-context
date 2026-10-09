@@ -568,6 +568,18 @@ def make_tool_handler(tool_name: str) -> Callable[..., str]:
     return handler
 
 
+def _stampable_header_value(value: Any) -> Optional[str]:
+    """#2455: HTTP header values are ByteStrings — a char above U+00FF (e.g. a Chinese
+    provider/model id) makes the host HTTP stack throw when it BUILDS the request, so
+    the whole turn dies before reaching the proxy. Return the value only when stamp-safe:
+    printable ASCII within the 1..256 span the proxy reader honors (same gate as the JS
+    lanes' asciiHeaderValue); else None so the caller skips the header."""
+    v = str(value)
+    if 1 <= len(v) <= 256 and all(0x21 <= ord(c) <= 0x7e for c in v):
+        return v
+    return None
+
+
 def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> Optional[Dict[str, Any]]:
     """llm_request middleware: stamp plugin-mode headers once the native tools are registered.
     Round 1 (before tools are ready) deliberately returns None — it rides wire mode."""
@@ -584,7 +596,9 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
         merged["x-bili-plugin-conversation"] = str(session_id)
         model = context.get("model")
         if model:
-            merged["x-bili-plugin-model"] = str(model)[:256]
+            model_header = _stampable_header_value(model)
+            if model_header is not None:
+                merged["x-bili-plugin-model"] = model_header
         max_output = _state["max_output"].get(str(session_id))
         if isinstance(max_output, (int, float)) and max_output > 0:
             merged["x-bili-plugin-max-output"] = str(int(max_output))

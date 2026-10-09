@@ -19,6 +19,23 @@ const STATUS_TIMEOUT_MS = 5000;
 const ATTACH_HEALTH_DEADLINE_MS = 15000;
 const ATTACH_HEALTH_POLL_MS = 250;
 
+// #2455: HTTP header values are ByteStrings — a char above U+00FF (e.g. a
+// Chinese provider/model id like "浮生云算/gpt-6.1-sol") makes undici throw a
+// TypeError when the host BUILDS the request, so the whole turn dies locally
+// before it ever reaches the proxy. Guard every user/host-controllable string
+// we stamp into an x-bili-plugin-* header through this one gate. Returns the
+// value unchanged only when it is stamp-safe: printable ASCII (VCHAR, no
+// whitespace/control) within the 1..256 span the proxy's own reader honors
+// (/^\S{1,256}$/ in pluginReportedModel). Anything else yields undefined so the
+// caller SKIPS the header — the proxy then falls back to the body model /
+// registry table with no side effect (a missing header is explicitly trusted
+// by pluginHeadersMatchModel). Deliberately stricter than raw latin1: a value
+// with whitespace would pass a bare ByteString check yet be rejected by the
+// proxy's \S gate anyway, so excluding it here changes nothing observable.
+export function asciiHeaderValue(value: string): string | undefined {
+    return /^[\x21-\x7e]{1,256}$/.test(value) ? value : undefined;
+}
+
 /** Detect the proxy from a provider baseUrl's `/bili/` zero-config prefix.
  *  The real prefix embeds the full upstream URL (`/bili/https://…`), so the
  *  check requires `bili` as the first path segment followed by an http(s)

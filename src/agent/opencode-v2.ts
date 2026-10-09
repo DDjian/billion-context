@@ -49,7 +49,7 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { asciiHeaderValue, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -320,7 +320,8 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 if (window !== undefined) headers.set("x-bili-plugin-context-window", String(window));
                 const output = state.outputs?.get(key);
                 if (output !== undefined) headers.set("x-bili-plugin-max-output", String(output));
-                headers.set("x-bili-plugin-model", model.id);
+                const modelHeader = asciiHeaderValue(model.id);
+                if (modelHeader !== undefined) headers.set("x-bili-plugin-model", modelHeader);
                 reportRuntimeInfoOnChange(state.proxyBase, { agent: "opencode", model: model.id, contextWindow: window, maxOutput: output, source: "client-config" });
             }
             reportDerived(sid);

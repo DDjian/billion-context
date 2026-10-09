@@ -72,7 +72,7 @@ import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
-import { fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
+import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -659,7 +659,8 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                 if (w !== undefined) output.headers["x-bili-plugin-context-window"] = String(w);
                 const o = outputs.get(key);
                 if (o !== undefined) output.headers["x-bili-plugin-max-output"] = String(o);
-                output.headers["x-bili-plugin-model"] = model.id;
+                const modelHeader = asciiHeaderValue(model.id);
+                if (modelHeader !== undefined) output.headers["x-bili-plugin-model"] = modelHeader;
                 reportRuntimeInfoOnChange(base, { agent: "opencode", model: model.id, contextWindow: w, maxOutput: o, source: "client-config" });
             }
             maybeReportDerived(base, input.sessionID);

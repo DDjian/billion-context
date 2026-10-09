@@ -346,6 +346,8 @@ elif SCENARIO.startswith("attach"):
         while not RECORDED["runtime_info"] and __import__("time").monotonic() < deadline:
             __import__("time").sleep(0.05)
         second = mw(request=second_req, original_request=second_req, session_id="sess-1", model="test-model", provider="p", api_mode="chat")
+        cjk_req = {"model": "m-cjk", "messages": []}
+        cjk = mw(request=cjk_req, original_request=cjk_req, session_id="sess-1", model="浮生云算/gpt-6.1-sol", provider="p", api_mode="chat")
         tool_result = ctx.tools.get("compress", {}).get("handler")({}, session_id="sess-1", task_id="t1")
         no_session_result = ctx.tools.get("compress", {}).get("handler")({}, task_id="t1")
         # #2072 negative leg: the model-transcribed conversation_id channel stays UNFLAGGED
@@ -356,6 +358,7 @@ elif SCENARIO.startswith("attach"):
             "first_headers": first["request"]["extra_headers"] if isinstance(first, dict) else None,
             "second_headers": second["request"]["extra_headers"] if isinstance(second, dict) else None,
             "second_model_kept": second["request"].get("model") if isinstance(second, dict) else None,
+            "cjk_headers": cjk["request"]["extra_headers"] if isinstance(cjk, dict) else None,
             "tool_result": tool_result,
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
@@ -407,6 +410,7 @@ interface DriverOut {
     first_headers?: Record<string, string> | null;
     second_headers?: Record<string, string> | null;
     second_model_kept?: string | null;
+    cjk_headers?: Record<string, string> | null;
     tool_result?: string;
     no_session_result?: string;
     transcribed_result?: string;
@@ -457,6 +461,12 @@ describe("python plugin runtime (subprocess)", () => {
         const h2 = out!.second_headers!;
         assert.equal(h2["x-bili-plugin-max-output"], "4096");
         assert.equal(out!.second_model_kept, "test-model");
+        // #2455: a non-ASCII (Chinese) model id must never reach the header — the host
+        // HTTP stack throws on ByteString conversion when building the request.
+        const hc = out!.cjk_headers!;
+        assert.equal(hc["x-bili-plugin"], "hermes");
+        assert.equal(hc["x-bili-plugin-conversation"], "sess-1");
+        assert.equal(hc["x-bili-plugin-model"], undefined);
         assert.equal(out!.tool_result, "compressed 3 blocks");
         // #2072: kwargs session_id channel is flagged; the model-transcribed
         // conversation_id channel must stay unflagged (fail closed, #1685)
