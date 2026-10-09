@@ -57,14 +57,23 @@ describe("canonical projection (#2480)", () => {
         const weird = '{"a":1} trailing';
         assert.equal(canonicalTextOf(weird), weird);
     });
-    test("fingerprint excludes toolCallId and contentType, includes content", () => {
+    test("fingerprint excludes toolCallId, normalizes content; reasoning is an id-carrier", () => {
         const a = positionalFingerprint(msg("h1", "assistant", '{"cmd":"ls"}', { toolName: "bash", toolCallId: "call_A", contentType: "tool-call" }));
-        const b = positionalFingerprint(msg("h2", "assistant", '{ "cmd": "ls" }', { toolName: "bash", toolCallId: "toolu_B", contentType: "reasoning" }));
+        const b = positionalFingerprint(msg("h2", "assistant", '{ "cmd": "ls" }', { toolName: "bash", toolCallId: "toolu_B", contentType: "tool-call" }));
         assert.equal(a, b, "codec re-serialization + id scheme rewrite must not move the fingerprint");
         const c = positionalFingerprint(msg("h3", "assistant", '{"cmd":"ls -la"}', { toolName: "bash", toolCallId: "call_A", contentType: "tool-call" }));
         assert.notEqual(a, c, "a real edit is a real mismatch");
         const d = positionalFingerprint(msg("h4", "user", '{"cmd":"ls"}', { toolName: "bash", toolCallId: "call_A", contentType: "tool-call" }));
         assert.notEqual(a, d, "role participates");
+        // reasoning core text IS the provider item id (responses adapter), so
+        // the fingerprint deliberately ignores it: churning rs_0→alt_rs_0 must
+        // not move the pairing (kind changes, though, are structural — see
+        // codecSwitch()).
+        const r1 = positionalFingerprint(msg("r1", "assistant", "rs_0", { contentType: "reasoning" }));
+        const r2 = positionalFingerprint(msg("r2", "assistant", "alt_rs_0", { contentType: "reasoning" }));
+        assert.equal(r1, r2, "reasoning id churn must not move the fingerprint");
+        const r3 = positionalFingerprint(msg("r3", "user", "rs_0", { contentType: "reasoning" }));
+        assert.notEqual(r1, r3, "role still participates for reasoning");
     });
     test("pathological nesting never throws (falls back to raw bytes)", () => {
         const deep = "[".repeat(50000) + "]".repeat(50000);
@@ -96,8 +105,15 @@ function codecSwitch(old: CoreMessage[], editIndex?: number, idPrefix = "new"): 
         if (m.toolCallId === undefined) return msg(`${idPrefix}_${i}`, m.role, text ?? "", { contentType: "text" });
         const parsed = JSON.parse(m.text ?? "{}") as Record<string, unknown>;
         const reserialized = Object.keys(parsed).reverse().map((k) => `${JSON.stringify(k)}:${JSON.stringify(parsed[k])}`).join(", ");
+        // contentType stays "tool-call": real wire adapters normalize item kinds
+        // onto the core kinds (anthropic tool_use / openai function / responses
+        // function_call all land as tool-call), and the #2480 fingerprint is
+        // deliberately kind-sensitive — a message CHANGING kind is a
+        // structural edit Pass 0 must refuse to bridge. Reasoning is the one
+        // kind whose core text is the provider item id itself (id-carrier),
+        // handled explicitly in positionalFingerprint().
         return msg(`${idPrefix}_${i}`, m.role, `{${reserialized}}`, {
-            contentType: "reasoning", toolName: m.toolName, toolCallId: `call_x_fc_${i}`,
+            contentType: "tool-call", toolName: m.toolName, toolCallId: `call_x_fc_${i}`,
         });
     });
 }

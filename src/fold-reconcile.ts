@@ -303,6 +303,22 @@ export function positionalFingerprintWorkCount(): number {
 export function positionalFingerprint(message: CoreMessage): string {
     positionalFingerprintWork++;
     const h = createHash("sha256");
+    // #2480: reasoning items are id-carrier messages — the responses wire
+    // adapter projects the PROVIDER-ITEM ID itself as the core text (probe:
+    // responsesToCore([{type:"reasoning",id:"rs_0",...}]) yields
+    // text="rs_0"; the encrypted blob never reaches core). The id is exactly
+    // the protocol-volatile token this layer exists to survive, so hashing it
+    // would break the pairing at the first reasoning message of every churn
+    // (observed live: Pass 0 head scan stopped at index 1, byPos=0,
+    // unmatched=12 on the responses lane). Fingerprint reasoning on role
+    // alone: position still anchors the pairing, and consecutive reasoning
+    // blobs are opaque by construction — claiming across a reasoning deletion
+    // folds an equivalent-by-role message into the covered span, the same
+    // “equivalent content” discipline as duplicate prose turns.
+    if (message.contentType === "reasoning") {
+        h.update(`${message.role}\u0000reasoning-id-carrier\u0000`);
+        return h.digest("hex").slice(0, 16);
+    }
     h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonicalTextOf(message.text ?? "")}`);
     return h.digest("hex").slice(0, 16);
 }
@@ -609,6 +625,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const positions = storedPositions !== undefined && storedPositions.length === oldOrder.length ? storedPositions : undefined;
 
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    if (process.env.FOLD_RECONCILE_DEBUG === "1") {
+        const active = blocks.filter((b) => b.active).length;
+        const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
+        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} byTool=${plan.byTool} byNorm=${plan.byNorm} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+    }
 
     // Seed/refresh anchors for covered ids present in this pass (including
     // freshly claimed ones — the next churn must re-anchor from post-churn
