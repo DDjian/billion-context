@@ -692,7 +692,12 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 if (!(err instanceof TypeError) || isDeadClosureError(err)) throw err;
                 const deadOrigin = new URL(target).origin;
                 const again = await recover(deadOrigin);
-                if (again !== undefined && again !== deadOrigin) {
+                if (again !== undefined) {
+                    // #2496: a recovery that lands back on the SAME origin is a
+                    // transient blip, not a loss — the proxy is alive and the
+                    // baked URL still points at it, so retry there instead of
+                    // giving up (the old give-up fired onGiveUp, which deletes
+                    // BILLION_CONTEXT_PROXY process-wide in the omp/pi lanes).
                     const u = new URL(target);
                     const retried = `${again}${u.pathname}${u.search}`;
                     const restamped = withHeaders(makeTarget(retried), init, routedExtra);
