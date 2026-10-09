@@ -1670,6 +1670,88 @@ test("arbitration: count-ready T3 rotates in under high t1Eff (#509)", () => {
   assert.match(turnB.nudge.reason ?? "", /4 tier-2 blocks >= tier3Trigger 3/);
 });
 
+test("arbitration: dual count-ready pool — oldest stamp wins, tie breaks to lower tier (#509)", () => {
+  const core = createCore();
+  const config = buildConfig({
+    tiers: { enabled: true, tier2Trigger: 5, tier3Trigger: 3 },
+    compress: {
+      minCompressRange: 5000,
+      maxSummaryLength: 0,
+      minSummaryLength: 0,
+    },
+    preserveRecentMessages: 0,
+  });
+  const messages = makeMessages(10);
+  let state = core.processTurn({
+    messages,
+    state: createInitialState(),
+    config,
+    tokenCount: 10_000,
+  }).state;
+  // 5 T1 blocks (>= tier2Trigger 5) + 4 T2 blocks (>= tier3Trigger 3): BOTH
+  // distillation triggers count-ready at once, masses far below the mass gate.
+  state = {
+    ...state,
+    blocks: [
+      ...t1Blocks([["m0"], ["m1"], ["m2"], ["m3"], ["m4"]], 400),
+      ...t2Blocks(4, 400, ["m2"]),
+    ],
+  };
+  const turnA = core.processTurn({
+    messages,
+    state,
+    config,
+    tokenCount: 60_000,
+  });
+  assert.equal(turnA.nudge.shouldInject, true, `reason: ${turnA.nudge.reason}`);
+  assert.equal(turnA.nudge.tier, 1, "fresh rotation memory -> T1 first pick");
+
+  // T2 shown a while ago (cadence met), T3 never shown (absent stamp = 0 =
+  // oldest): the never-shown tier must rotate in ahead of the lower-tier one.
+  const stateB = {
+    ...turnA.state,
+    nudge: {
+      ...turnA.state.nudge,
+      lastShownByTier: { ...turnA.state.nudge.lastShownByTier, 2: 50_000 },
+    },
+  };
+  const turnB = core.processTurn({
+    messages,
+    state: stateB,
+    config,
+    tokenCount: 66_000,
+  });
+  assert.equal(turnB.nudge.shouldInject, true, `reason: ${turnB.nudge.reason}`);
+  assert.equal(
+    turnB.nudge.tier,
+    3,
+    `never-shown T3 outranks older-stamped T2: ${turnB.nudge.reason}`,
+  );
+
+  // Tie: the slot just went to T1 (so T1 keeps no first pick), both distill
+  // tiers never shown -> the lower tier (T2) wins the equal-stamp comparison.
+  const stateC = {
+    ...turnB.state,
+    nudge: {
+      ...turnB.state.nudge,
+      lastInjectedTier: 1,
+      lastShownByTier: { 1: 66_000 },
+    },
+  };
+  const turnC = core.processTurn({
+    messages,
+    state: stateC,
+    config,
+    tokenCount: 72_000,
+  });
+  assert.equal(turnC.nudge.shouldInject, true, `reason: ${turnC.nudge.reason}`);
+  assert.equal(
+    turnC.nudge.tier,
+    2,
+    `equal stamps break to the lower tier: ${turnC.nudge.reason}`,
+  );
+});
+
 test("arbitration: T2 slot survives repeated T1 compressions (#509 rotation memory)", () => {
   const core = createCore();
   const config = buildConfig({
