@@ -902,3 +902,24 @@ test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)
         "embed releases the hidden <col> tracks",
     );
 });
+
+test("#2473: the web face keeps its canvas coupled to the color scheme", () => {
+    // The ?embed=1 face drops its opaque ground (--bg: transparent) to blend
+    // into the host panel. If the document never declares color-scheme, its
+    // default canvas stays WHITE regardless of scheme — so under DSH's dark
+    // theme (prefers-color-scheme: dark) the light-scheme text (#e6edf3)
+    // landed on a white ground and the overview stats went unreadable (#2473).
+    // `color-scheme: light dark` on the BASE :root makes the canvas follow the
+    // SAME prefers-color-scheme signal that drives the palette, so ground and
+    // text stay consistent in BOTH schemes. Pin it in the base block (before
+    // the dark @media), not buried inside one scheme's override — that is the
+    // exact placement that keeps the coupling symmetric.
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8");
+    const declIdx = styles.search(/color-scheme:\s*light\s+dark/);
+    const mediaIdx = styles.indexOf("@media (prefers-color-scheme: dark)");
+    assert.notEqual(declIdx, -1, "declares color-scheme: light dark on :root");
+    assert.ok(
+        mediaIdx !== -1 && declIdx < mediaIdx,
+        "color-scheme sits in the base :root (before the dark @media) so both schemes inherit it",
+    );
+});

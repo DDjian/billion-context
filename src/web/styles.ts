@@ -1,5 +1,10 @@
 export const WEB_STYLES = String.raw`
 :root {
+    /* #2473: bind the document canvas to the SAME signal that drives the
+       palette (prefers-color-scheme). Without this the canvas stays white no
+       matter the scheme, so the embed face (--bg: transparent) painted its
+       light-scheme text on a white ground in dark mode → unreadable stats. */
+    color-scheme: light dark;
     --bg: #ffffff;
     --bg-elev: #f6f8fa;
     --bg-muted: #f0f2f5;
