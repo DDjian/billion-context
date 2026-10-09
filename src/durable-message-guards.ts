@@ -1,17 +1,21 @@
-// #2419: durable-state message guards, declared per plugin lane.
+// #2419/#2447: durable-state message guards, declared per plugin lane.
 //
 // Some hosts inject DURABLE STATE as ordinary conversation messages and gate
-// re-injection on a content fingerprint: dsh-tool-skill ships its skill
-// catalog (\x3cavailable_skills\x3e) as a user-role system-reminder once per
-// session and never resends it while the sha256(name+description) digest is
-// unchanged. ACP compression treats every history message as consumable, so
-// one fold of the catalog silently kills skill triggering forever (the host
-// will not resend what it believes is already present). The kernel's
-// protection surface was tool-exchange-only (protectedTools / isToolProtected),
-// structurally unable to cover a plain text message — hence the generic
-// Config.isMessageProtected hook (kernel 0.0.108) and this lane-scoped policy
-// map. The mechanism lives in the kernel; the POLICY (which shapes, for which
-// host) lives here, one entry per lane with traffic evidence.
+// re-injection on a content fingerprint: dsh ships two such carriers as
+// user-role messages — dsh-tool-skill's skill catalog (\x3cavailable_skills\x3e,
+// #2419; never resent while the sha256(name+description) digest is unchanged)
+// and @deepseek-ai/dsh-agent-instructions' workspace-instructions baseline
+// (#2447: global + project AGENTS.md merged into ONE message, re-emitted only
+// when baselineIdentity — projectRoot + discovery/budget config, NOT file
+// contents — changes). ACP compression treats every history message as
+// consumable, so one fold of either carrier silently kills its guidance
+// forever (the host will not resend what it believes is already present). The
+// kernel's protection surface was tool-exchange-only (protectedTools /
+// isToolProtected), structurally unable to cover a plain text message — hence
+// the generic Config.isMessageProtected hook (kernel 0.0.108) and this
+// lane-scoped policy map. The mechanism lives in the kernel; the POLICY
+// (which shapes, for which host) lives here, one entry per lane with traffic
+// evidence.
 //
 // KDD #9 evidence-permitlist discipline applies: entries are added PER HOST
 // with traffic evidence (shape + stability proof), never enabled wholesale —
@@ -33,9 +37,29 @@ export function dshSkillCatalogGuard(msg: CoreMessage): boolean {
     return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("\x3cavailable_skills\x3e");
 }
 
+/** dsh workspace-instructions guard (#2447): matches the durable AGENTS.md
+ *  baseline message injected by @deepseek-ai/dsh-agent-instructions — global
+ *  (~/.dsh/AGENTS.md) and project instructions merged into ONE user-role
+ *  \x3csystem-reminder\x3e message whose sections are labelled
+ *  `Instructions from: <path>` (source: lib/index.js sectionText +
+ *  createUserMessage). The host re-emits the baseline only when
+ *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
+ *  changes, so one fold of it silently kills hard constraints like "read X
+ *  before any web access" forever. Same marker-over-wrapper rationale as
+ *  dshSkillCatalogGuard: the per-file label is matched on its own so wrapper/
+ *  intro rewording cannot silently disarm the guard; a false positive is
+ *  benign (a matching message simply stays visible). The match is
+ *  case-sensitive on purpose — reconciliation change messages use lowercase
+ *  variants ("Updated instructions from:") that remain ordinary consumable
+ *  history. At most ~one such baseline lives per session (replacements are
+ *  rare identity changes), so pinning every match is bounded. */
+export function dshWorkspaceInstructionsGuard(msg: CoreMessage): boolean {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:");
+}
+
 /** Lane → guard registry. Only lanes with traffic evidence of the
  *  durable-user-message carrier belong here (KDD #9). Keyed by the value of
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
 export const durableMessageGuards: Record<string, DurableMessageGuard> = {
-    dsh: dshSkillCatalogGuard,
+    dsh: (msg) => dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg),
 };
