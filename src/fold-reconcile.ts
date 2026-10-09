@@ -49,6 +49,12 @@ type FoldReconcileMode = "off" | "warn" | "repair";
 
 const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
+/** #2480 Phase 1: self-stored canonical position copy `{ ids, canon }`, kept in
+ *  lockstep with foldAnchorOrder (same MAX_ORDER cap discipline). canon[i] is
+ *  the protocol-invariant projection fingerprint of the message at position i;
+ *  ids[] mirrors the order backbone so the copy is self-contained and can never
+ *  desync from its own positions even if the order backbone's semantics change. */
+ export const METADATA_POSITIONS = "foldPositions";
 /** #1921: last-noted system-prompt fingerprint ({fp, size}), consumed by both
  *  the fold-reconcile drift alert and the cache ledger's prompt-rewrite
  *  attribution (#2350). */
@@ -123,6 +129,10 @@ interface ReconciliationPlan {
     claims: Map<string, string>;
     byTool: number;
     byNorm: number;
+    /** #2480 Phase 1: covered ids reclaimed by positional canonical alignment
+     *  (Pass 0) — identity is the position in the self-stored canonical copy,
+     *  content equality is the confidence check, never the identity itself. */
+    byPos: number;
     /** Covered ids missing from the resent history with no match — either
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
@@ -140,6 +150,8 @@ interface FoldReconcileResult {
     claims: number;
     byTool: number;
     byNorm: number;
+    /** #2480 Phase 1: covered ids reclaimed by positional canonical alignment. */
+    byPos: number;
     unmatched: number;
 }
 
@@ -223,6 +235,68 @@ export function normalizedIdentityNoToolCallId(message: CoreMessage): string {
     return h.digest("hex").slice(0, 16);
 }
 
+/** #2480 Phase 1: canonical-projection computations performed by this module.
+ *  Same measurement-seam discipline as normalizedIdentityWork (#2334): the
+ *  steady-state same-id fast path must pay ZERO projections, and wall-clock
+ *  thresholds alone cannot prove the work is gone. */
+let canonicalProjectionWork = 0;
+export function resetCanonicalProjectionWork(): void {
+    canonicalProjectionWork = 0;
+}
+export function canonicalProjectionWorkCount(): number {
+    return canonicalProjectionWork;
+}
+
+/** #2480 Phase 1: protocol-invariant canonical projection of a message.
+ *
+ *  Fold-coverage identity becomes POSITIONAL (#2480): this projection is a
+ *  content-confidence comparator only — it never names identity. It drops the
+ *  two protocol-volatile factors of the kernel's deriveMessageId seed that
+ *  break a codec switch — the toolCallId scheme (call_/toolu_/…) and the raw
+ *  serialized argument bytes — and normalizes the two churn axes that survive:
+ *    - tool-call argument re-serialization → JSON.parse + key-sorted compact
+ *      (parse failure falls back to the raw bytes, then text normalization);
+ *    - prose / tool-result formatting churn → normalizeMessageText.
+ *  The three wire codecs map one logical message to the same (role, toolName,
+ *  text) core shape, so a message is canon-equal across ANY wire codec: a
+ *  model/provider switch rewrites every id yet leaves array order and projected
+ *  content intact — exactly what positional Pass 0 exploits to reclaim coverage
+ *  without touching the wire id (still used for wire-layer dedup). */
+export function canonicalProjection(message: CoreMessage): string {
+    canonicalProjectionWork++;
+    const h = createHash("sha256");
+    h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonicalContent(message.contentType, message.text)}`);
+    return h.digest("hex").slice(0, 16);
+}
+
+/** Content half of the canonical projection: JSON-canonicalize tool-call
+ *  arguments (key-order/whitespace-insensitive), otherwise collapse formatting
+ *  churn. A parse failure on an arg payload keeps the raw bytes normalized — a
+ *  malformed-JSON churn still aligns by its normalized text and never throws. */
+function canonicalContent(contentType: string | undefined, text: string | undefined): string {
+    if (text === undefined || text === "") return "";
+    if (contentType === "tool-call") {
+        try {
+            return canonicalJson(JSON.parse(text));
+        } catch {
+            return normalizeMessageText(text);
+        }
+    }
+    return normalizeMessageText(text);
+}
+
+/** Key-order-insensitive compact JSON. Objects are re-emitted with sorted keys
+ *  at every depth; arrays keep element order; primitives stringify verbatim.
+ *  Deterministic: the same logical arguments yield byte-identical output under
+ *  any wire codec's serialization. */
+function canonicalJson(value: unknown): string {
+    if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "";
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(record[k])}`).join(",")}}`;
+}
+
 function anchorFrom(message: CoreMessage): FoldAnchor {
     const t = message.toolCallId !== undefined && message.toolCallId !== "" ? message.toolCallId : undefined;
     const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, b: message.text?.length ?? 0 };
@@ -262,8 +336,10 @@ export function planReconciliation(
     anchors: Record<string, FoldAnchor>,
     msgs: CoreMessage[],
     covered: Set<string>,
+    newCanon?: string[],
+    oldCanon?: string[],
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byTool: 0, byNorm: 0, unmatched: [], idRewriteSuspects: 0 };
+    const plan: ReconciliationPlan = { claims: new Map(), byTool: 0, byNorm: 0, byPos: 0, unmatched: [], idRewriteSuspects: 0 };
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) {
@@ -293,9 +369,51 @@ export function planReconciliation(
         oldOrder[oldOrder.length - 1 - suffix] === newOrder[newOrder.length - 1 - suffix]
     ) suffix++;
 
+    const claimedCandidates = new Set<string>();
+
+    // Pass 0 — positional canonical alignment (#2480 Phase 1). Identity is the
+    // position in bili's self-stored canonical copy; canonicalProjection is a
+    // content-confidence check, never identity. Runs only when BOTH passes
+    // carried a canon copy of matching length — migration-free: the first
+    // post-upgrade pass has none, so it falls straight through to pass 1/2 and
+    // writes the copy for the next pass. Head-align + tail-align bidirectional
+    // scan over the churn region: a codec/model switch rewrites every id yet
+    // leaves array order and projected content intact, so every aligned
+    // position claims; a client-side head-truncation keeps the tail, which
+    // tail-align reclaims while the vanished head flows to the EXISTING
+    // unmatched/archive pipeline (reuse, not a new landing — #1195/#1001).
+    // Bounded O(n): one forward + one backward walk, no O(n²) alignment tries.
+    if (newCanon !== undefined && oldCanon !== undefined && oldCanon.length > 0
+            && oldCanon.length === oldOrder.length && newCanon.length === newOrder.length) {
+        let hOld = prefix, hNew = prefix;
+        while (hOld < oldOrder.length - suffix && hNew < newOrder.length - suffix
+                && oldCanon[hOld] === newCanon[hNew]) {
+            const o = oldOrder[hOld];
+            if (missingSet.has(o)) {
+                plan.claims.set(o, newOrder[hNew]);
+                claimedCandidates.add(newOrder[hNew]);
+                plan.byPos++;
+            }
+            hOld++;
+            hNew++;
+        }
+        let tOld = oldOrder.length - 1 - suffix, tNew = newOrder.length - 1 - suffix;
+        while (tOld >= hOld && tNew >= hNew && tOld >= prefix && tNew >= prefix
+                && oldCanon[tOld] === newCanon[tNew]) {
+            const o = oldOrder[tOld];
+            if (!plan.claims.has(o) && missingSet.has(o)) {
+                plan.claims.set(o, newOrder[tNew]);
+                claimedCandidates.add(newOrder[tNew]);
+                plan.byPos++;
+            }
+            tOld--;
+            tNew--;
+        }
+    }
+
     // Candidates: inbound messages inside the churn region whose id is not
     // already covered (covered-present ids are exact matches of other old ids
-    // and must not be claimed twice).
+    // and must not be claimed twice) nor already claimed by Pass 0.
     // #2334: norms are computed LAZILY — pass 1 (toolCallId) never needs them,
     // so a fully tool-claimable churn region pays zero normalizations; pass 2
     // computes each norm once, only for the candidates pass 1 left behind.
@@ -303,11 +421,11 @@ export function planReconciliation(
     for (let i = prefix; i < newOrder.length - suffix; i++) {
         const id = newOrder[i];
         if (covered.has(id)) continue;
+        if (claimedCandidates.has(id)) continue;
         const message = byId.get(id);
         if (message === undefined) continue;
         candidates.push({ id, message });
     }
-    const claimedCandidates = new Set<string>();
 
     // Missing covered ids inside the churn region, in previous-pass order.
     const missingMiddle: string[] = [];
@@ -331,6 +449,7 @@ export function planReconciliation(
             else bucket.push(cand);
         }
         for (const oldId of missingMiddle) {
+            if (plan.claims.has(oldId)) continue; // #2480: already reclaimed by Pass 0
             const anchor = anchors[oldId];
             if (anchor === undefined || anchor.t === undefined || anchor.r === undefined) continue;
             const bucket = byToolCallId.get(anchor.t);
@@ -440,13 +559,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, byPos: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, byPos: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -459,15 +578,40 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, byPos: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, byPos: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
     const oldOrder: string[] = (session.metadata[METADATA_ORDER] as string[] | undefined) ?? [];
+    // #2480 Phase 1: build this pass's canonical position copy. The same-id fast
+    // path reuses a stored canon whenever the message id survived from the last
+    // pass — id is a content hash, so same id ⇒ identical bytes ⇒ identical
+    // canon — keeping steady-state passes at ZERO canonical projections. A pass
+    // with no stored copy yet (first post-upgrade request) computes every canon
+    // fresh; that one-time fill is what makes migration free (no bridging of
+    // existing hash-anchor sessions).
+    const oldPositions = session.metadata[METADATA_POSITIONS] as { ids: string[]; canon: string[] } | undefined;
+    const prevCanonById = new Map<string, string>();
+    if (oldPositions !== undefined) {
+        const pids = oldPositions.ids;
+        const pcanon = oldPositions.canon;
+        for (let i = 0; i < pids.length; i++) {
+            const c = pcanon[i];
+            if (c !== undefined) prevCanonById.set(pids[i], c);
+        }
+    }
+    const fullOrder: string[] = [];
+    const fullCanon: string[] = [];
+    for (const m of msgs) {
+        if (m.id === undefined) continue;
+        fullOrder.push(m.id);
+        const priorCanon = prevCanonById.get(m.id);
+        fullCanon.push(priorCanon !== undefined ? priorCanon : canonicalProjection(m));
+    }
 
-    const plan = planReconciliation(oldOrder, anchors, msgs, covered);
+    const plan = planReconciliation(oldOrder, anchors, msgs, covered, fullCanon, oldPositions?.canon);
 
     // Seed/refresh anchors for covered ids present in this pass (including
     // freshly claimed ones — the next churn must re-anchor from post-churn
@@ -522,7 +666,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             anchorCount++;
         }
     }
-    const nextOrder = msgs.map((m) => m.id).filter((id): id is string => id !== undefined).slice(-MAX_ORDER);
+    // #2480 Phase 1: roll the canonical position copy forward on the SAME cap
+    // discipline as the order backbone — both are the last MAX_ORDER of this
+    // pass's id sequence, sliced together so canon[i] stays aligned to ids[i].
+    const nextOrder = fullOrder.slice(-MAX_ORDER);
+    const nextCanon = fullCanon.slice(-MAX_ORDER);
 
     // #2202: per-block coverage evidence for the ledger's conditional accrual
     // (METADATA_FOLD_COVERAGE). Present = verbatim on this pass's wire;
@@ -567,6 +715,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
 
     session.metadata[METADATA_ANCHORS] = nextAnchors;
     session.metadata[METADATA_ORDER] = nextOrder;
+    session.metadata[METADATA_POSITIONS] = { ids: nextOrder, canon: nextCanon };
     // The wire sites already schedule a save on every turn (state replacement
     // + markDirty); the metadata ride that existing save.
 
@@ -600,15 +749,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, byPos: 0, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} by position, ${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921/#2480)`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable (${plan.byPos} position, ${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921/#2480)`);
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193
@@ -626,6 +775,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         claims: plan.claims.size,
         byTool: plan.byTool,
         byNorm: plan.byNorm,
+        byPos: plan.byPos,
         unmatched: plan.unmatched.length,
     };
 }

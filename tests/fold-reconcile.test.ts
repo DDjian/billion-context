@@ -4,11 +4,15 @@ import {
     normalizeMessageText,
     normalizedIdentity,
     normalizedIdentityNoToolCallId,
+    canonicalProjection,
+    resetCanonicalProjectionWork,
+    canonicalProjectionWorkCount,
     planReconciliation,
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
     METADATA_FOLD_COVERAGE,
+    METADATA_POSITIONS,
     resetNormalizedIdentityWork,
     normalizedIdentityWorkCount,
     type FoldAnchor,
@@ -175,6 +179,213 @@ describe("planReconciliation (#1921)", () => {
     });
 });
 
+describe("canonicalProjection (#2480)", () => {
+    const tc = (id: string, name: string, args: string, toolCallId?: string): CoreMessage =>
+        msg(id, "assistant", args, { contentType: "tool-call", toolName: name, toolCallId });
+
+    test("strips the toolCallId scheme and normalizes arg key order (cross-protocol invariant)", () => {
+        // openai-style call_ id + one arg order vs anthropic-style toolu_ id + reordered/spaced args
+        const a = tc("m1", "search", '{"q":"x","n":1}', "call_abc");
+        const b = tc("m2", "search", '{"n": 1, "q":"x"}', "toolu_xyz");
+        assert.equal(canonicalProjection(a), canonicalProjection(b));
+    });
+
+    test("distinct logical content projects differently", () => {
+        const a = tc("m1", "search", '{"q":"x","n":1}', "call_abc");
+        const b = tc("m2", "search", '{"q":"y","n":1}', "call_abc");
+        assert.notEqual(canonicalProjection(a), canonicalProjection(b));
+    });
+
+    test("malformed JSON args fall back to normalized raw bytes without throwing", () => {
+        const a = tc("m1", "search", "{bad json here", "call_a");
+        const b = tc("m2", "search", "{different payload", "toolu_b");
+        assert.doesNotThrow(() => canonicalProjection(a));
+        assert.notEqual(canonicalProjection(a), canonicalProjection(b));
+        const c = tc("m3", "search", "{bad  json here", "call_c"); // formatting churn still normalizes
+        assert.equal(canonicalProjection(a), canonicalProjection(c));
+    });
+
+    test("non-tool-call content ignores formatting churn but not real edits", () => {
+        const a = msg("m1", "user", "please analyze module 2");
+        const b = msg("m2", "user", "please analyze  module 2\r\n");
+        assert.equal(canonicalProjection(a), canonicalProjection(b));
+        const c = msg("m3", "user", "please analyze module 2X");
+        assert.notEqual(canonicalProjection(a), canonicalProjection(c));
+    });
+
+    test("contentType is deliberately excluded from identity (#2480 spec)", () => {
+        const a = msg("m1", "assistant", "some reply text");
+        const b = msg("m2", "assistant", "some reply text", { contentType: "reasoning" });
+        assert.equal(canonicalProjection(a), canonicalProjection(b));
+    });
+
+    test("work seam counts exactly one projection per call (#2334 discipline)", () => {
+        resetCanonicalProjectionWork();
+        assert.equal(canonicalProjectionWorkCount(), 0);
+        canonicalProjection(msg("m1", "user", "hi"));
+        canonicalProjection(tc("m2", "s", "{}"));
+        assert.equal(canonicalProjectionWorkCount(), 2);
+    });
+});
+
+describe("planReconciliation Pass 0 positional (#2480)", () => {
+    const canonOf = (msgs: CoreMessage[]): string[] => msgs.map(canonicalProjection);
+    const anchorsOf = (msgs: CoreMessage[]): Record<string, FoldAnchor> => {
+        const a: Record<string, FoldAnchor> = {};
+        for (const m of msgs) a[m.id!] = anchorOf(m);
+        return a;
+    };
+
+    test("codec/model switch rewrites every id; Pass 0 reclaims all by position (acceptance #1)", () => {
+        const oldMsgs = [
+            msg("o1", "user", "first turn"),
+            msg("o2", "assistant", '{"q":"x","n":1}', { contentType: "tool-call", toolName: "search", toolCallId: "call_A" }),
+            msg("o3", "tool_result", "result body", { contentType: "tool-result", toolName: "search", toolCallId: "call_A" }),
+        ];
+        const newMsgs = [
+            msg("n1", "user", "first turn"),
+            msg("n2", "assistant", '{"n": 1, "q":"x"}', { contentType: "tool-call", toolName: "search", toolCallId: "toolu_B" }),
+            msg("n3", "tool_result", "result body", { contentType: "tool-result", toolName: "search", toolCallId: "toolu_B" }),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorsOf(oldMsgs), newMsgs,
+            new Set(oldMsgs.map((m) => m.id!)), canonOf(newMsgs), canonOf(oldMsgs));
+        assert.equal(plan.byPos, 3);
+        assert.equal(plan.claims.get("o1"), "n1");
+        assert.equal(plan.claims.get("o2"), "n2");
+        assert.equal(plan.claims.get("o3"), "n3");
+        assert.equal(plan.unmatched.length, 0);
+    });
+
+    test("truncate-head-keep-tail + codec switch: tail keeps coverage, head falls to unmatched (acceptance #2)", () => {
+        const oldMsgs = [
+            msg("h1", "user", "head one"),
+            msg("h2", "user", "head two"),
+            msg("t1", "user", "tail one"),
+            msg("t2", "user", "tail two"),
+        ];
+        const newMsgs = [
+            msg("t1-new", "user", "tail one"),
+            msg("t2-new", "user", "tail two"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorsOf(oldMsgs), newMsgs,
+            new Set(oldMsgs.map((m) => m.id!)), canonOf(newMsgs), canonOf(oldMsgs));
+        assert.equal(plan.claims.get("t1"), "t1-new");
+        assert.equal(plan.claims.get("t2"), "t2-new");
+        assert.equal(plan.byPos, 2);
+        assert.deepEqual(plan.unmatched, ["h1", "h2"]);
+    });
+
+    test("content veto: a real edit breaks the run there; the stable tail still reclaims (acceptance #4)", () => {
+        const oldMsgs = [
+            msg("a", "user", "alpha"),
+            msg("b", "user", "beta"),
+            msg("c", "user", "gamma"),
+            msg("d", "user", "delta"),
+        ];
+        const newMsgs = [
+            msg("a-n", "user", "alpha"),
+            msg("b-edited", "user", "beta COMPLETELY DIFFERENT"),
+            msg("c-n", "user", "gamma"),
+            msg("d-n", "user", "delta"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorsOf(oldMsgs), newMsgs,
+            new Set(oldMsgs.map((m) => m.id!)), canonOf(newMsgs), canonOf(oldMsgs));
+        assert.equal(plan.claims.get("a"), "a-n");
+        assert.equal(plan.claims.get("c"), "c-n");
+        assert.equal(plan.claims.get("d"), "d-n");
+        assert.deepEqual(plan.unmatched, ["b"]);
+    });
+
+    test("deletion shifts the survivors left; tail-align reclaims them, deleted one stays unmatched", () => {
+        const oldMsgs = [
+            msg("a", "user", "alpha"),
+            msg("b", "user", "beta"),
+            msg("c", "user", "gamma"),
+            msg("d", "user", "delta"),
+        ];
+        const newMsgs = [
+            msg("a-n", "user", "alpha"),
+            msg("c-n", "user", "gamma"),
+            msg("d-n", "user", "delta"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorsOf(oldMsgs), newMsgs,
+            new Set(oldMsgs.map((m) => m.id!)), canonOf(newMsgs), canonOf(oldMsgs));
+        assert.equal(plan.claims.get("a"), "a-n");
+        assert.equal(plan.claims.get("c"), "c-n");
+        assert.equal(plan.claims.get("d"), "d-n");
+        assert.deepEqual(plan.unmatched, ["b"]);
+    });
+
+    test("without a canonical copy Pass 0 is inert (migration-free first pass, acceptance #3)", () => {
+        const oldMsgs = [
+            msg("o1", "user", "first turn"),
+            msg("o2", "assistant", '{"q":"x","n":1}', { contentType: "tool-call", toolName: "search", toolCallId: "call_A" }),
+            msg("o3", "tool_result", "result body", { contentType: "tool-result", toolName: "search", toolCallId: "call_A" }),
+        ];
+        const newMsgs = [
+            msg("n1", "user", "first turn"),
+            msg("n2", "assistant", '{"n": 1, "q":"x"}', { contentType: "tool-call", toolName: "search", toolCallId: "toolu_B" }),
+            msg("n3", "tool_result", "result body", { contentType: "tool-result", toolName: "search", toolCallId: "toolu_B" }),
+        ];
+        // No canon arrays (first post-upgrade pass has none stored) -> Pass 0 is inert.
+        // The plain-text twin is STILL reclaimed by legacy pass 2 (content match, no
+        // toolCallId involved); only the tool-call messages — whose id SCHEME changed
+        // (call_ -> toolu_) — are honestly lost until the position copy exists. That gap
+        // self-heals on the next live pass (acceptance #3).
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorsOf(oldMsgs), newMsgs,
+            new Set(oldMsgs.map((m) => m.id!)));
+        assert.equal(plan.byPos, 0, "Pass 0 inert without a canonical copy");
+        assert.deepEqual([...plan.claims.entries()], [["o1", "n1"]], "plain-text twin reclaimed by legacy pass 2");
+        assert.deepEqual(plan.unmatched, ["o2", "o3"], "tool-id scheme change -> honest loss until canon exists");
+    });
+});
+
+describe("reconcileFoldCoverage positional copy (#2480)", () => {
+    function fakeSession(blocks: { effectiveMessageIds: string[]; directMessageIds?: string[] }[]): Session {
+        return { state: { blocks: blocks.map((b) => ({ active: true, ...b })) }, metadata: {} } as unknown as Session;
+    }
+    const opts = (mode?: "off" | "warn" | "repair"): ReconcileOptions & { mode?: "off" | "warn" | "repair" } =>
+        ({ mode, sessionId: "pos", log: () => {} });
+
+    test("codec switch after a clean seed pass reclaims every covered id by position (acceptance #1/#3)", () => {
+        const seed = [
+            msg("o0", "user", "first user turn"),
+            msg("o1", "assistant", '{"op":"run","k":1}', { contentType: "tool-call", toolName: "act", toolCallId: "call_X" }),
+            msg("o2", "tool_result", "result ok", { contentType: "tool-result", toolName: "act", toolCallId: "call_X" }),
+            ...Array.from({ length: 7 }, (_, i) => msg(`o${i + 3}`, "user", `pad turn ${i}`)),
+        ];
+        const switched = [
+            msg("n0", "user", "first user turn"),
+            msg("n1", "assistant", '{"k": 1, "op":"run"}', { contentType: "tool-call", toolName: "act", toolCallId: "toolu_Y" }),
+            msg("n2", "tool_result", "result ok", { contentType: "tool-result", toolName: "act", toolCallId: "toolu_Y" }),
+            ...Array.from({ length: 7 }, (_, i) => msg(`n${i + 3}`, "user", `pad turn ${i}`)),
+        ];
+        const ids = seed.map((m) => m.id!);
+        const session = fakeSession([{ effectiveMessageIds: ids, directMessageIds: [...ids] }]);
+        reconcileFoldCoverage(session, seed, opts("repair"));
+        assert.ok((session.metadata.foldPositions as unknown) !== undefined, "position copy established on the seed pass");
+        const result = reconcileFoldCoverage(session, switched, opts("repair"));
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.byPos, 10);
+        assert.equal(result.unmatched, 0);
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, switched.map((m) => m.id!));
+    });
+
+    test("steady-state resend pays zero canonical projections (same-id fast path, #2480/#2334)", () => {
+        const seed = Array.from({ length: 12 }, (_, i) => msg(`s${i}`, "user", `stable body ${i}`));
+        const session = fakeSession([{ effectiveMessageIds: seed.map((m) => m.id!) }]);
+        resetCanonicalProjectionWork();
+        reconcileFoldCoverage(session, seed, opts("repair"));
+        assert.equal(canonicalProjectionWorkCount(), 12, "cold fill projects each message once");
+        const snapshot = JSON.stringify(session.metadata);
+        resetCanonicalProjectionWork();
+        const second = reconcileFoldCoverage(session, seed, opts("repair"));
+        assert.equal(second.kind, "resend");
+        assert.equal(canonicalProjectionWorkCount(), 0, "steady-state same-id pass pays ZERO projections");
+        assert.equal(JSON.stringify(session.metadata), snapshot, "metadata byte-stable across a steady-state pass");
+    });
+});
+
 describe("reconcileFoldCoverage (#1921)", () => {
     function fakeSession(blocks: { effectiveMessageIds: string[]; directMessageIds?: string[] }[]): Session {
         return {
@@ -208,7 +419,10 @@ describe("reconcileFoldCoverage (#1921)", () => {
         const churned = originals.map((m, i) => (i === 4 ? msg("a4-new", "user", "stable context  words 4\r\n") : m));
         const result = reconcileFoldCoverage(session, churned, opts("repair"));
         assert.equal(result.kind, "reanchored");
-        assert.equal(result.byNorm, 1);
+        // #2480: same-content, position-stable churn is now reclaimed by Pass 0
+        // (positional canonical alignment) instead of the normalized-identity pass.
+        assert.equal(result.byPos, 1);
+        assert.equal(result.byNorm, 0);
         const rewritten = allIds.map((id, i) => (i === 4 ? "a4-new" : id));
         assert.deepEqual(session.state.blocks[0].effectiveMessageIds, rewritten);
         assert.deepEqual(session.state.blocks[0].directMessageIds, rewritten);
@@ -626,7 +840,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, byPos: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -688,10 +902,14 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const result = reconcileFoldCoverage(session, churned, opts);
         assert.equal(result.kind, "reanchored");
         assert.equal(result.byTool, 4);
-        assert.equal(result.byNorm, 4);
+        // #2480: the 4 plain-text churns are same-content + position-stable, so
+        // Pass 0 reclaims them by position BEFORE any normalized identity is
+        // computed — they no longer pay a candidate norm (was byNorm=4).
+        assert.equal(result.byNorm, 0);
+        assert.equal(result.byPos, 4);
         assert.equal(result.unmatched, 0);
-        assert.equal(normalizedIdentityWorkCount(), 16,
-            "4 tool claim-anchor rebuilds × 2 (#2396 no-tool norm rides along) + 4 plain claim rebuilds + 4 unclaimed-candidate norms");
+        assert.equal(normalizedIdentityWorkCount(), 12,
+            "4 tool claim-anchor rebuilds × 2 (#2396 no-tool norm rides along) + 4 plain claim rebuilds; the 4 plain candidate norms pass 2 used to pay are gone — Pass 0 aligned them positionally first");
     });
 });
 
@@ -739,7 +957,11 @@ describe("rewrite-suspect detection (#2396)", () => {
     }
     const errorLines = (logs: LogLine[]) => logs.filter((l) => l.level === "error");
 
-    test("provider-switch rewrite: 10 unmatched pairs stay unrepaired, named in logs, escalate once", () => {
+    test("pre-upgrade session (no position copy): provider-switch rewrite stays unrepaired, detected, escalates once", () => {
+        // #2480 Phase 1 keeps the #2396 detection-only contract for the window
+        // where positional identity is NOT yet available — a persisted session
+        // that predates the position copy. Once the copy exists (next live pass)
+        // the aligned rewrites are reclaimed instead (see the sibling test).
         const ids = ["b0", ...Array.from({ length: 10 }, (_, i) => `t${i + 1}`), "b9"];
         const originals: CoreMessage[] = [msg("b0", "user", "bookend zero")];
         for (let i = 1; i <= 10; i++) originals.push(msg(`t${i}`, "tool_result", `tool payload ${i}`, { toolCallId: `call_${i}|raw`, toolName: "probe" }));
@@ -748,7 +970,8 @@ describe("rewrite-suspect detection (#2396)", () => {
             state: { blocks: [{ active: true, effectiveMessageIds: [...ids] }] },
             metadata: {},
         } as unknown as Session;
-        reconcileFoldCoverage(session, originals, makeOpts([])); // seed anchors + order
+        reconcileFoldCoverage(session, originals, makeOpts([])); // seed anchors + order (+ position copy)
+        delete session.metadata[METADATA_POSITIONS]; // simulate a pre-upgrade persisted session
 
         const rewritten = (): CoreMessage[] => [
             msg("b0", "user", "bookend zero"),
@@ -792,6 +1015,43 @@ describe("rewrite-suspect detection (#2396)", () => {
         // the cause lives in the first drift warn above (honest-output rule).
         assert.doesNotMatch(err.msg, /host-rewritten tool-call ids/);
         assert.equal(logs.filter((l) => l.level === "warn").length, 2, "passes 1-2 warn; pass 3 is the single error line");
+    });
+
+    test("with a position copy: provider-switch rewrite fully reclaimed by position (acceptance #1)", () => {
+        const ids = ["b0", ...Array.from({ length: 10 }, (_, i) => `t${i + 1}`), "b9"];
+        const originals: CoreMessage[] = [msg("b0", "user", "bookend zero")];
+        for (let i = 1; i <= 10; i++) originals.push(msg(`t${i}`, "tool_result", `tool payload ${i}`, { toolCallId: `call_${i}|raw`, toolName: "probe" }));
+        originals.push(msg("b9", "assistant", "bookend nine"));
+        const session: Session = {
+            state: { blocks: [{ active: true, effectiveMessageIds: [...ids] }] },
+            metadata: {},
+        } as unknown as Session;
+        reconcileFoldCoverage(session, originals, makeOpts([])); // seed anchors + order + position copy
+
+        const rewritten = (): CoreMessage[] => [
+            msg("b0", "user", "bookend zero"),
+            ...Array.from({ length: 10 }, (_, i) => msg(`t${i + 1}-rw`, "tool_result", `tool payload ${i + 1}`, { toolCallId: `call_${i + 1}_raw`, toolName: "probe" })),
+            msg("b9", "assistant", "bookend nine"),
+        ];
+
+        const logs: LogLine[] = [];
+        const first = reconcileFoldCoverage(session, rewritten(), makeOpts(logs));
+        // Positional identity reclaims every aligned rewrite on the FIRST pass —
+        // the #2454/#2396 bug class resolved by construction: no loss, no
+        // escalation. Pass 0 consumes all candidates before pass 2 runs, so no
+        // churn-region normalization is paid either.
+        assert.equal(first.kind, "reanchored");
+        assert.equal(first.byPos, 10);
+        assert.equal(first.claims, 10);
+        assert.equal(first.unmatched, 0);
+        const rewrittenIds = ["b0", ...Array.from({ length: 10 }, (_, i) => `t${i + 1}-rw`), "b9"];
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            rewrittenIds,
+            "fold rewritten onto the reclaimed ids — coverage preserved across the codec switch");
+        const second = reconcileFoldCoverage(session, rewritten(), makeOpts(logs));
+        assert.equal(second.kind, "resend", "every covered id present again → clean steady-state resend");
+        assert.equal(errorLines(logs).length, 0, "no total-loss episode → no escalation error");
     });
 
     test("v0 anchors backfill their no-tool norm while bytes are still on the wire", () => {
