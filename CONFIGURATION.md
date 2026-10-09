@@ -2120,6 +2120,8 @@ Automatic pressure/overflow compaction is off; manual `/compact` and the tool-re
 | `- insert:` with `id: preset-standard` | appends a **second** `preset-standard` row at the tree tail; the live preset is untouched |
 | full `config` snapshot + one `auto: false` | ✅ entry count unchanged, only delta is `auto: false` |
 
+**The snapshot is frozen at the dsh version you copied from.** Unlike a bundle-layer patch, a profile-layer `config` is a point-in-time copy: after a dsh upgrade adds, removes, or reconfigures a row inside the shipped preset, this override keeps serving the old roster — new plugins silently never load. Re-run step 1, diff the new `preset-standard` block against the one in your patch, and re-copy it whole whenever that section changes. If you would rather not maintain a snapshot, leave native auto-compaction on and let the #1729/#2432 rebase path handle the interaction instead.
+
 Because a partial override fails without any diagnostic, always re-dump and compare entry counts after editing.
 - Under the opencode launcher/native mode a present `opencode-acp` is info-only by design (#920 absorbs it for legacy sessions); everywhere else it warns.
 - Disable: `BILI_CONFLICT_SCAN=0`.

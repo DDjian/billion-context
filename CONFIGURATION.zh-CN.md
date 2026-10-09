@@ -2091,6 +2091,8 @@ dsh --profile <name> --dump-config > /tmp/profile.yml
 | `- insert:` + `id: preset-standard` | 在树末尾**追加第二条** `preset-standard`；真正运行的 preset 未被修改 |
 | 完整 `config` 快照 + 一处 `auto: false` | ✅ 条目数不变，唯一差异是 `auto: false` |
 
+**快照会冻结在你复制的那个 dsh 版本上。** 与 bundle 层补丁不同，profile 层的 `config` 是一份时点拷贝：dsh 升级后若增删或调整了内置 preset 里的行，这份覆盖仍会继续供应旧名单 —— 上游新加的插件不会静默加载。请重新执行第 1 步，把新的 `preset-standard` 段与补丁里的那份做 diff，只要该段有变化就整段重抄一次。若不想维护这份快照，那就保持原生自动压缩开启，让 #1729/#2432 的 rebase 路径去处理两者的相互作用。
+
 部分覆盖失败时没有任何诊断信息，所以改完务必重新 dump 并比对条目数。
 - opencode launcher/native 模式下已存在的 `opencode-acp` 按设计只记 info（#920 有意吸收它处理 legacy 会话）；其他场景一律告警。
 - 关闭方式：`BILI_CONFLICT_SCAN=0`。
