@@ -1,16 +1,22 @@
-// #2419/#2447: durable-state message guards, declared per plugin lane.
+// #2419/#2447/#2481: durable-state message guards, declared per plugin lane.
 //
 // Some hosts inject DURABLE STATE as ordinary conversation messages and gate
-// re-injection on a content fingerprint: dsh ships two such carriers as
+// re-injection on a content fingerprint: dsh ships three such carriers as
 // user-role messages — dsh-tool-skill's skill catalog (\x3cavailable_skills\x3e,
-// #2419; never resent while the sha256(name+description) digest is unchanged)
-// and @deepseek-ai/dsh-agent-instructions' workspace-instructions baseline
+// #2419; never resent while the sha256(name+description) digest is unchanged),
+// @deepseek-ai/dsh-agent-instructions' workspace-instructions baseline
 // (#2447: global + project AGENTS.md merged into ONE message, re-emitted only
 // when baselineIdentity — projectRoot + discovery/budget config, NOT file
-// contents — changes). ACP compression treats every history message as
-// consumable, so one fold of either carrier silently kills its guidance
-// forever (the host will not resend what it believes is already present). The
-// kernel's protection surface was tool-exchange-only (protectedTools /
+// contents — changes), and the agent-loop runtime-context snapshot (#2481:
+// sandbox/approval policy state, self-declared "supersedes earlier
+// runtime-context snapshots" — resent only when the runtime context CHANGES,
+// not every turn). ACP compression treats every history message as consumable,
+// so one fold of any carrier silently kills its guidance forever (the host
+// will not resend what it believes is already present). The structured
+// source.kind these hosts stamp internally never reaches the proxy wire
+// (CoreMessage carries no metadata field), so the guards match stable text
+// markers instead — the same criterion discipline as #2447. The kernel's
+// protection surface was tool-exchange-only (protectedTools /
 // isToolProtected), structurally unable to cover a plain text message — hence
 // the generic Config.isMessageProtected hook (kernel 0.0.108) and this
 // lane-scoped policy map. The mechanism lives in the kernel; the POLICY
@@ -57,9 +63,30 @@ export function dshWorkspaceInstructionsGuard(msg: CoreMessage): boolean {
     return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:");
 }
 
+/** dsh runtime-context guard (#2481): matches the durable runtime-context
+ *  snapshot injected by the dsh agent loop — sandbox/approval policy state
+ *  carried as a user-role message containing "Current runtime context"
+ *  (source: deepseek-ai/deepseek-harness MIT packages/core/agent-loop/src/
+ *  runtime-context.ts; the same text family bili already recognizes as an
+ *  auto-injected notification in #2286's AUTO_INJECTED_NOTIFICATION_PREFIXES).
+ *  Both variants match on purpose: the populated snapshot ("Current runtime
+ *  context. This snapshot supersedes earlier runtime-context snapshots. …")
+ *  AND the cleared form ("Current runtime context: none. Earlier
+ *  runtime-context snapshots no longer apply.") — the cleared notice must
+ *  stay visible too, because it is what invalidates the older snapshots this
+ *  guard pins. The host re-emits only when the runtime context CHANGES (the
+ *  per-turn time-context carrier deliberately stays foldable), so one fold of
+ *  the latest snapshot silently drops the session's sandbox/approval semantics
+ *  forever. Each snapshot is tiny (~100–400 chars); superseded ones keep
+ *  pinning harmlessly because the newest carries the supersedes clause. */
+export function dshRuntimeContextGuard(msg: CoreMessage): boolean {
+    return msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context");
+}
+
 /** Lane → guard registry. Only lanes with traffic evidence of the
  *  durable-user-message carrier belong here (KDD #9). Keyed by the value of
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
 export const durableMessageGuards: Record<string, DurableMessageGuard> = {
-    dsh: (msg) => dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg),
+    dsh: (msg) =>
+        dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg) || dshRuntimeContextGuard(msg),
 };
