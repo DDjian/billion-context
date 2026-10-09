@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { afterEach, test } from "node:test";
-import { extractSummaryText, unwrapDataEnvelope } from "../src/preflight.ts";
+import { extractSummaryFromSse, extractSummaryText, unwrapDataEnvelope } from "../src/preflight.ts";
+import { extractDecisionText } from "../src/nudge-decide.ts";
 import { createSummaryHttpCandidate, type SummaryHttpTarget } from "../src/external-summary-http.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import type { PreflightProtocol } from "../src/preflight.ts";
@@ -49,6 +50,19 @@ test("extractSummaryText reads choices through a data envelope", () => {
 test("extractSummaryText still returns empty for an error body wearing a data envelope", () => {
     const errored = { error: { message: "empty response content" }, data: { choices: [] } };
     assert.equal(extractSummaryText("openai", errored), "");
+});
+
+test("extractSummaryFromSse reads delta content through a per-frame data envelope", () => {
+    const sse = "data: " + JSON.stringify({ data: { choices: [{ delta: { content: summary }, index: 0 }] } }) + "\n\n";
+    assert.equal(extractSummaryFromSse("openai", sse), summary);
+    const double = "data: " + JSON.stringify({ data: { data: { choices: [{ delta: { content: summary }, index: 0 }] } } }) + "\n\n";
+    assert.equal(extractSummaryFromSse("openai", double), "");
+});
+
+test("extractDecisionText reads the model answer through a data envelope and leaves standard bodies untouched", () => {
+    const answer = JSON.stringify({ compress: false });
+    assert.equal(extractDecisionText("openai", { data: { choices: [{ message: { role: "assistant", content: answer } }] } }), answer);
+    assert.equal(extractDecisionText("openai", { choices: [{ message: { role: "assistant", content: answer } }] }), answer);
 });
 
 async function withUpstream(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void, run: (url: string) => Promise<void>): Promise<void> {
