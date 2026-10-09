@@ -46,7 +46,7 @@ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encodin
 import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { emergencyNudge } from "./budget.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -1428,6 +1428,14 @@ export async function handle(
         const demotedSide = demoteGate({ countTokens, responsesCompact, protocol, pluginMode, requestAgent, wsLaneEnvelope, publicForkPrefix })
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
+        // #2500: Claude Code's WebSearch sub-request is a host-internal utility
+        // call under the MAIN session id (single message, every tool a
+        // server-executed web_search_/web_fetch_ version). It rides the #388
+        // side passthrough below via isSideRequest, and must ALSO skip
+        // restoreOutputBudget here — its max_tokens sizes the search response,
+        // not a main turn, and seeding outputBudgetHighWater from it would
+        // poison the first starved restore (same class as the #1897 skip).
+        const serverToolUtility = isServerToolUtilityCall(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
@@ -1439,7 +1447,7 @@ export async function handle(
         // outputBudgetHighWater from it would poison the first starved restore
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
-        if (!demotedSide) {
+        if (!demotedSide && !serverToolUtility) {
             restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader));
         }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
@@ -1507,11 +1515,11 @@ export async function handle(
         // all-bili-tools leak shape is heuristic, and a fork child's early
         // mainline turns (raw inherited prefix, no artifacts yet, no agent
         // header) can false-positive it — only intent-certain side
-        // identification (declared side agent, or a tool-less tiny budget)
-        // diverts under a receipt.
+        // identification (declared side agent, a tool-less tiny budget, or the
+        // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
