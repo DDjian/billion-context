@@ -2032,6 +2032,68 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 - **发现结果的出口**：客户端启动前的 launcher stderr；每个会话首个请求的一次性代理 warn 日志（client 由 `x-bili-plugin` 头或 wire 头识别）；会话冲突台账 —— `acp_status` 的 `COMPRESSION CONFLICTS` 段、`GET /__bili/stats` → `conflicts`、Web UI 横幅。
 - **运行时证据**：未宣告的历史改写（#1001）与孤儿块废弃（被摘要的内容从客户端历史中被删掉）记入同一台账，让「疑似并存」与「实际观测到的干扰」互相印证。
 - **dsh 的 `auto: false` 只关闭自动触发**。profile bundle patch（`dsh.bundle.patch.yml`）写入的 `compaction-basic: { auto: false }` 跳过压力/溢出自压缩 —— 手动 `/compact`（以及空闲会话压缩）仍会触发。经 bili 路由的调用会被服务端闸门拒绝（#1729/#2360）；未经过 bili 直达上游的调用（桌面端插件接管门无法归因的路径）会落地，bili 在下次重放时检测出来（checkpoint 框架 + 折叠覆盖缺口），一个 turn 内重建自己的压缩状态，而不是让之后每次 compress 永久失败（#2432）。
+
+#### 在 web profile 下关掉 dsh 原生自动压缩（#1772/#2474）
+
+随包发行的 `dsh.bundle.patch.yml` 做不到这件事：在 bundles 含 `@deepseek-ai/dsh-web-app` 的 profile 里，它的 `- id: compaction-basic` 行落在 web-app 的**宿主层行上，而那一行本来就是 `disabled: true`**；真正在运行的实例位于 `preset-standard.config.plugins` 内部。补丁静默生效、什么都没改。
+
+**profile 层补丁可以关掉它** —— preset 是 bundle 层插入的普通顶层条目，而 profile 补丁层在其之后应用。不能用「按 id 定位嵌套行」的写法，可行的是**整体覆盖 preset 行的 `config`**。
+
+**配方**（已在 dsh `0.2.1-alpha.1`、Windows 11、bundles 含 `@deepseek-ai/dsh-web-app` 的 profile 上实测）：
+
+```bash
+# 1. dump 组合后的 profile，复制 preset-standard 的完整 config 块
+dsh --profile <name> --dump-config > /tmp/profile.yml
+```
+
+2. 往 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 追加一条 `preset-standard`，`config` 用上一步 dump 出的**完整内容**（每一个 `plugins` 条目逐字节照抄），只改一处：在 `compaction` 组里的 `compaction-basic` 行下加 `config: { auto: false }`。
+
+```yaml
+- id: preset-standard
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: standard
+    order: 1
+    plugins:
+      # … dump 出的全部条目，原样照抄 …
+      - id: compaction
+        name: cordis:group
+        group: true
+        isolate:
+          compaction: true
+          toolResultPruner: true
+        config:
+          - id: compaction-basic
+            name: '@deepseek-ai/dsh-compaction-basic'
+            config:
+              auto: false            # ← 唯一改动
+          - id: command-compact
+            name: '@deepseek-ai/dsh-command-compact'
+          - id: tool-result-pruner
+            name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+            config:
+              thresholdChars: 8192
+              headChars: 4096
+              tailChars: 1024
+      # … 其余条目原样照抄 …
+```
+
+3. 用之前先核对：`dsh --profile <name> --dump-config | grep -A2 'id: compaction-basic'` —— `preset-standard` 的条目数必须**不变**，且嵌套行现在带上了 `config.auto: false`。
+
+压力/溢出自动压缩关掉，手动 `/compact` 与 tool-result pruner 保留。若会话会用到 `preset-ptc` / `preset-cordis`，按同样形状各做一份（`preset-minimal` 没有 `compaction` 组）。
+
+**三种错法 —— 全都静默**（同一份 dump 上实测）：
+
+| 补丁写法 | 结果 |
+|---|---|
+| `- id: preset-standard.compaction.compaction-basic` | `patch: entry "…" not found`；**无任何效果** |
+| `- id: preset-standard` + 只写部分 `config.plugins` | `config` 是**替换而非合并** —— preset 塌缩成你写的那几项（实测 35 → 3）：persona、工具全没了 |
+| `- insert:` + `id: preset-standard` | 在树末尾**追加第二条** `preset-standard`；真正运行的 preset 未被修改 |
+| 完整 `config` 快照 + 一处 `auto: false` | ✅ 条目数不变，唯一差异是 `auto: false` |
+
+**快照会冻结在你复制的那个 dsh 版本上。** 与 bundle 层补丁不同，profile 层的 `config` 是一份时点拷贝：dsh 升级后若增删或调整了内置 preset 里的行，这份覆盖仍会继续供应旧名单 —— 上游新加的插件不会静默加载。请重新执行第 1 步，把新的 `preset-standard` 段与补丁里的那份做 diff，只要该段有变化就整段重抄一次。若不想维护这份快照，那就保持原生自动压缩开启，让 #1729/#2432 的 rebase 路径去处理两者的相互作用。
+
+部分覆盖失败时没有任何诊断信息，所以改完务必重新 dump 并比对条目数。
 - opencode launcher/native 模式下已存在的 `opencode-acp` 按设计只记 info（#920 有意吸收它处理 legacy 会话）；其他场景一律告警。
 - 关闭方式：`BILI_CONFLICT_SCAN=0`。
 
