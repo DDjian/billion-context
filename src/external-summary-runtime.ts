@@ -3,9 +3,14 @@ import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
 import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
 import { ExternalSummaryExecutor, type ExternalSummaryBatchResult, type SummaryCandidate, type SummaryWork } from "./external-summary.js";
+import { log as loggerLog } from "./logger.js";
 
 // One shared queue across all sessions and all compression entry points.
 const executor = new ExternalSummaryExecutor(4);
+
+// The plan is rebuilt on every request, so a persistently-misconfigured chain
+// must not spam a warn line per request — dedupe by (candidate, reason).
+const seenCandidateWarnings = new Set<string>();
 
 export class ConfiguredSummaryPlan {
     private readonly candidates: readonly SummaryCandidate[];
@@ -25,13 +30,22 @@ export class ConfiguredSummaryPlan {
         this.candidates = this.settings.targets.map((target) => {
             try {
                 const key = target.apiKey !== undefined ? target.apiKey : store.resolve(target.credentialRef ?? "", env);
-                if (!key) throw new Error();
+                if (!key) throw new Error(`credential ${target.credentialRef || "(none)"} did not resolve to a value`);
                 const headers: Record<string, string> = target.protocol === "anthropic" ? { "x-api-key": key }
                     : target.protocol === "google" ? { "x-goog-api-key": key }
                     : { authorization: `Bearer ${key}` };
                 return createSummaryHttpCandidate({ ...target, headers, proxyUrl }, this.settings.budget.maxSummaryBytes * 4 + 65536);
-            } catch {
-                // Preserve order without leaking private errors or borrowing main auth.
+            } catch (error) {
+                // Log WHY this target is unusable (once per signature) so a
+                // misconfigured chain is diagnosable instead of silently degrading
+                // every fold to main-model summaries (#2484). The placeholder keeps
+                // its generic message so no private detail leaks into results/wire.
+                const reason = error instanceof Error ? error.message : String(error);
+                const signature = `${target.name}|${reason}`;
+                if (!seenCandidateWarnings.has(signature)) {
+                    seenCandidateWarnings.add(signature);
+                    loggerLog("warn", `[external-summary] candidate ${target.name} unavailable: ${reason} — it will be skipped until fixed`);
+                }
                 return { async summarize(): Promise<string> { throw new Error("External summary candidate unavailable"); } };
             }
         });

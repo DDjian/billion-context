@@ -66,7 +66,11 @@ function text(value: unknown, limit: number): string {
 function parseBudget(raw: unknown): SummaryBudget {
     const rawBudget = raw === undefined ? {} : object(raw);
     knownKeys(rawBudget, ["totalTimeoutMs", "targetTimeoutMs", "maxSummaryBytes"]);
-    const totalTimeoutMs = integer(rawBudget.totalTimeoutMs, SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, 100, 50_000);
+    // totalTimeoutMs bounds the WHOLE batch (one shared deadline across every
+    // chunk); a big-session fold runs a dozen or more chunks, so the cap needs
+    // real headroom. Long waits are safe — preflight holds the client with SSE
+    // keep-alives past its undici body timeout (#2484/#1647).
+    const totalTimeoutMs = integer(rawBudget.totalTimeoutMs, SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, 100, 600_000);
     const targetTimeoutMs = integer(rawBudget.targetTimeoutMs, Math.min(SUMMARY_DEFAULT_BUDGET.targetTimeoutMs, totalTimeoutMs), 100, totalTimeoutMs);
     const maxSummaryBytes = integer(rawBudget.maxSummaryBytes, SUMMARY_DEFAULT_BUDGET.maxSummaryBytes, 128, 1024 * 1024);
     return { totalTimeoutMs, targetTimeoutMs, maxSummaryBytes };
