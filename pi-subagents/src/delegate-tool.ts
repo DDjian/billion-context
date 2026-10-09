@@ -11,6 +11,7 @@ import { Type, type Static } from "typebox";
 import { delegateStatusWidget } from "./fleet-widget.js";
 import type {
   AgentToolResult,
+  ContextEvent,
   ExtensionAPI,
   ExtensionContext,
   ToolDefinition,
@@ -26,12 +27,15 @@ const SETTLED_GRACE_MS = 10_000;
 const KILL_GRACE_MS = 10_000;
 const RESULT_SUMMARY_CHARS = 500;
 export const OUT_DIR = join(tmpdir(), "acp-delegate");
-// Completion notifications are committed when the host agent settles (goes
-// idle), not on a fixed timer (#2301): a fixed delay can fire before the model
-// has read the result file, committing an irrevocable follow-up that a later
-// read cannot recall. Finishes that land before the next settle still merge
-// into ONE message (issue #157) because they share the same settle-triggered
-// flush.
+// Completion notifications are committed at commit boundaries, never on a
+// fixed timer (#2301): while the host is BUSY, pending runs stay revocable
+// until the `context` event (fires before every model call) re-checks them and
+// merges survivors into ONE message appended to the very context about to hit
+// the provider — no async gap between check and commit, so a result the model
+// already read/waited cannot be double-delivered. While IDLE (no model call
+// coming) ONE merged steering message starts a turn instead (#2320: a follow-
+// up parked there would wait out the whole task). Finishes landing between
+// boundaries merge into that same message (#157).
 const SESSION_EXT = ".session.jsonl";
 const ACTIVITY_TAIL_CHARS = 400;
 
@@ -694,7 +698,7 @@ const agentListLine = (name: string): string => {
 };
 
 export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof DelegateParams> {
-  ensureHostSettleHandlers(pi);
+  ensureHostNotificationHandlers(pi);
   const maxConcurrent = delegatePolicy.maxConcurrent;
   const concurrencyNote = Number.isFinite(maxConcurrent)
     ? `\n• Concurrency limit: at most ${maxConcurrent} background delegate(s) run at once; extra launches stay QUEUED and start automatically as slots free. Set delegate.maxConcurrent in acp.json (or PI_ACP_DELEGATE_MAX_CONCURRENT) to change it.`
@@ -814,93 +818,190 @@ function undeliveredNotice(excludeRunId?: string): string {
   return undeliveredNoticeFrom(Array.from(runs.values()), excludeRunId);
 }
 
-// ─── Settle-gated completion notifications (#157, #2301) ───────────────────
-// Each injected notification is a follow-up turn for the model; delegates that
-// finish close together must share ONE message instead of piling up in the
-// queue. Committing is gated on the host agent settling (going idle) rather
-// than a fixed timer: at the settle boundary every read performed this round
-// has already been observed, so the flush can drop result files the model
-// already read (notifyIfRead "skip") and only deliver what it did not. A fixed
-// delay would commit an irrevocable follow-up before a later read lands, with
-// no API to recall it (#2301). Runs finishing while the host is idle are
-// delivered promptly so the async "launch and wait" pattern still wakes the
-// model without waiting for unrelated activity.
+// ─── Completion notifications: boundary commits (#157, #2301, #2320) ────────
+// Two delivery tiers, both read-checked AT COMMIT time (never earlier):
+//   1. BUSY host — the `context` event fires before every model call of this
+//      host (the agent loop's transformContext); the pending set is re-filtered
+//      there (waiter/consumed/read-suppression) and ONE merged notification is
+//      appended to the exact message list about to hit the provider. No await
+//      separates the final check from the real context commit, so nothing ever
+//      sits in an irrevocable host queue waiting out the task (#2301's
+//      post-commit race closed at the source; #2320's stalled follow-ups gone).
+//      Hosts whose extension surface lacks the `context` event never fire it —
+//      their pending set waits for tier 2 instead.
+//   2. IDLE host — no model call is coming, so there is no context to append
+//      to; ONE merged message goes out via sendUserMessage(steer), which starts
+//      a turn immediately.
+// Delegates finishing close together share ONE message in either tier (#157).
+// Failed runs are never read-suppressed (their file holds no failure marker);
+// failures stay loud. State is scoped PER HOST INSTANCE so a session switch can
+// never deliver one session's notifications into another's context.
 
-let notifyPi: ExtensionAPI | undefined;
-const notifyQueue: DelegateRun[] = [];
-let flushScheduled = false;
-/** Host agent runs currently in flight (agent_start .. agent_settled). Zero
- *  means the host is idle, which is when it is safe to commit pending
- *  notifications. */
-let hostAgentRuns = 0;
-
-const settleHandlerPis = new WeakSet<ExtensionAPI>();
-
-/** Register the host-lifecycle handlers that drive notification commits.
- *  Called from makeDelegateTool, which every delegate owner (the standalone
- *  factory AND each embedder) invokes at setup, so the settle hook reaches all
- *  wiring paths without any embedder-side change. Guarded per pi instance so
- *  repeated tool registration does not double-count host runs. */
-function ensureHostSettleHandlers(pi: ExtensionAPI): void {
-  // Tolerate a partial extension surface (some embedders/tests stub only the
-  // methods they use): without lifecycle events we still deliver via the
-  // idle-at-finish path, so degrade instead of failing tool registration.
-  if (typeof pi.on !== "function") return;
-  if (settleHandlerPis.has(pi)) return;
-  settleHandlerPis.add(pi);
-  pi.on("agent_start", () => {
-    hostAgentRuns += 1;
-  });
-  pi.on("agent_settled", () => {
-    if (hostAgentRuns > 0) hostAgentRuns -= 1;
-    maybeFlushNotifications();
-  });
+interface HostNotificationState {
+  /** Terminal runs awaiting their next commit boundary (revocable until then). */
+  queue: DelegateRun[];
+  /** agent_start..agent_settled runs in flight on THIS host. */
+  activeRuns: number;
+  /** Idle-tier flush already armed for this host. */
+  flushScheduled: boolean;
 }
 
-/** Schedule a read-checked flush on the next macrotask if the host is idle.
+const hostNotificationStates = new WeakMap<ExtensionAPI, HostNotificationState>();
+/** Strong refs so a target-less flush (tests/embedders) can enumerate hosts.
+ *  A process holds one live host (+ short-lived ones across session switches),
+ *  so this cannot grow unboundedly. */
+const knownHosts = new Set<ExtensionAPI>();
+
+function hostNotificationState(pi: ExtensionAPI): HostNotificationState {
+  let st = hostNotificationStates.get(pi);
+  if (!st) {
+    st = { queue: [], activeRuns: 0, flushScheduled: false };
+    hostNotificationStates.set(pi, st);
+    knownHosts.add(pi);
+  }
+  return st;
+}
+
+/** Register the host hooks that drive notification commits. Called from
+ *  makeDelegateTool, which every delegate owner (the standalone factory AND
+ *  each embedder) invokes at setup, so the hooks reach all wiring paths without
+ *  any embedder-side change. Guarded per pi instance so repeated tool
+ *  registration does not double-count host runs or double-register handlers. */
+function ensureHostNotificationHandlers(pi: ExtensionAPI): void {
+  // Tolerate a partial extension surface (some embedders/tests stub only the
+  // methods they use): without lifecycle events we still deliver via the idle
+  // tier or a later carrier recovery, so degrade instead of failing tool
+  // registration.
+  if (typeof pi.on !== "function") return;
+  if (hostNotificationStates.has(pi)) return;
+  const st = hostNotificationState(pi);
+  pi.on("agent_start", () => {
+    st.activeRuns += 1;
+  });
+  pi.on("agent_settled", () => {
+    if (st.activeRuns > 0) st.activeRuns -= 1;
+    maybeFlushNotifications(pi);
+  });
+  // Busy-tier commit point: fires before every LLM call of this host. Inert on
+  // hosts that lack the event (registration stays a harmless no-op then).
+  pi.on("context", (event: ContextEvent) => commitAtContextBoundary(st, event));
+}
+
+/** Schedule the idle-tier flush on the next macrotask if THIS host is idle.
  *  Deferred (setTimeout 0) so the sendUserMessage-driven turn starts only after
  *  the settling finally has fully unwound, avoiding two overlapping agent runs.
- *  At most one flush is ever pending, so same-tick finishes coalesce into one. */
-function maybeFlushNotifications(): void {
-  if (hostAgentRuns > 0) return;
-  if (flushScheduled) return;
-  flushScheduled = true;
+ *  At most one flush is ever pending per host, so same-tick finishes coalesce
+ *  into one. No-op while the host is busy: the `context` handler commits at the
+ *  next model call instead. */
+function maybeFlushNotifications(pi: ExtensionAPI): void {
+  const st = hostNotificationState(pi);
+  if (st.activeRuns > 0) return;
+  if (st.flushScheduled) return;
+  st.flushScheduled = true;
   const t = setTimeout(() => {
-    flushScheduled = false;
-    flushDelegateNotifications();
+    st.flushScheduled = false;
+    flushHostNotifications(pi);
   }, 0);
   t.unref?.();
 }
 
-/** Queue a finished run's completion notification for settle-gated delivery.
- *  Runs that finish before the next settle share one batched message (#157). If
- *  the host is already idle the flush is scheduled immediately; otherwise it
- *  waits for the next agent_settled, which re-checks reads before committing. */
+/** Queue a finished run's completion notification. While the host is busy the
+ *  entry stays REVOCABLE until the next `context` boundary re-checks it; when
+ *  the host is idle an immediate deferred flush is armed (idle tier). */
 export function scheduleRunNotification(pi: ExtensionAPI, run: DelegateRun): void {
-  if (!notifyQueue.includes(run)) notifyQueue.push(run);
+  const st = hostNotificationState(pi);
+  if (!st.queue.includes(run)) st.queue.push(run);
   run.notifyQueued = true;
-  notifyPi = pi;
-  maybeFlushNotifications();
+  maybeFlushNotifications(pi);
 }
 
-/** Deliver every undelivered terminal run (queued + any earlier lost ones) as
- *  a single injected message. Runs that gained a waiter or were consumed
- *  while queued are skipped — their result is owned by the wait/cancel path.
- *  On send failure nothing is marked delivered, so a later carrier recovers
- *  the batch via the normal undelivered-notice mechanism. */
-export function flushDelegateNotifications(): void {
-  const queued = new Set(notifyQueue.splice(0));
+/** Busy-tier commit: re-check ownership of queued runs EXACTLY where the model
+ *  context is being assembled (the `context` event) and, if anything survives,
+ *  append ONE merged notification user message to the outgoing message list.
+ *  Between the read/wait checks below and the returned array there is no await,
+ *  so a result the model already claimed cannot be double-delivered (#2301).
+ *  Runs dropped here reached the model another way (waiter/consumed/read-after-
+ *  finish suppression). Gate: commit only when the conversation already holds an
+ *  assistant message — a fresh first-turn context ([system?, user]) cannot carry
+ *  pending results yet (the child was spawned by an earlier response), and
+ *  refusing non-turn contexts keeps auxiliary calls from consuming the batch.
+ *  When the gate fails the queue is left intact for the next boundary. */
+function commitAtContextBoundary(st: HostNotificationState, event: ContextEvent) {
+  if (st.queue.length === 0) return undefined;
+  if (!event.messages.some((m) => m.role === "assistant")) return undefined;
+  const deliverable: DelegateRun[] = [];
+  for (const r of st.queue) {
+    r.notifyQueued = false;
+    if (r.waiter || r.consumed || r.injected) continue;
+    if (r.status !== "completed" && r.status !== "failed") continue;
+    // Read-check at commit time (#2301): a completed run whose result file the
+    // model already read (at/after finish) is dropped here, not delivered.
+    // Failed runs are never suppressed (failures stay loud).
+    if (r.status === "completed" && shouldSuppressRead(r, delegateNotifyIfRead)) {
+      applyReadSuppression(r, r.runId);
+      continue;
+    }
+    deliverable.push(r);
+  }
+  if (deliverable.length === 0) {
+    st.queue.length = 0;
+    return undefined;
+  }
+  const mode = delegateDisplayUsage;
+  let text: string;
+  let covered: DelegateRun[] = [];
+  if (deliverable.length === 1) {
+    const r = deliverable[0]!;
+    const built = buildInjectText(
+      r.agent, r.runId, r.task, r.status,
+      r.result?.code ?? null, r.result?.file ?? "", r.timedOut,
+      r.usage, mode, r.usageReported,
+      r.status === "failed" ? r.result?.body : undefined,
+      r.status === "failed" ? r.activityFile : undefined,
+      r.exitSignal,
+    );
+    text = built.text;
+    covered = built.covered;
+  } else {
+    for (const r of deliverable) {
+      if (mode === "separate" && r.usage && !r.usageReported) addDelegateUsage(r.usage);
+    }
+    text = buildBatchText(deliverable, mode, () => true);
+  }
+  for (const r of deliverable) {
+    r.injected = true; // committed synchronously below — no async window
+    if (r.usage && !r.usageReported) r.usageReported = true;
+  }
+  for (const c of covered) c.injected = true;
+  st.queue.length = 0;
+  debug.event("delegate-notify-context-commit", { count: deliverable.length, failed: deliverable.filter((r) => r.status === "failed").length, runIds: deliverable.map((r) => r.runId).join(",") });
+  logInfo("delegate", { event: "notify-context-commit", count: deliverable.length });
+  return { messages: [...event.messages, { role: "user" as const, content: [{ type: "text" as const, text }], timestamp: Date.now() }] };
+}
+
+/** Idle-tier delivery: every undelivered terminal run of ONE host (queued +
+ *  any earlier lost ones) as a single injected message. Called with no argument
+ *  (tests/embedders) to flush every known host. Runs that gained a waiter or
+ *  were consumed while queued are skipped — their result is owned by the
+ *  wait/cancel path. On send failure nothing is marked delivered, so a later
+ *  carrier recovers the batch via the normal undelivered-notice mechanism. */
+export function flushDelegateNotifications(target?: ExtensionAPI): void {
+  const hosts = target ? [target] : Array.from(knownHosts);
+  for (const h of hosts) flushHostNotifications(h);
+}
+
+function flushHostNotifications(pi: ExtensionAPI): void {
+  const st = hostNotificationState(pi);
+  const queued = new Set(st.queue.splice(0));
   for (const r of queued) r.notifyQueued = false;
-  const pi = notifyPi;
-  if (!pi) return;
   const owned = (r: DelegateRun): boolean => {
     if (r.waiter || r.consumed || r.injected) return false;
     if (r.status !== "completed" && r.status !== "failed") return false;
-    // Read-check at commit time (#2301): delivery is decided HERE, at the settle
+    // Read-check at commit time (#2301): delivery is decided HERE, at the commit
     // boundary, so a completed run whose result file the model already read
     // (at/after finish) is dropped instead of committed — not just reads that
-    // preceded some earlier fixed timer. Failed runs are never suppressed (their
-    // file holds no failure marker; failures stay loud).
+    // preceded some earlier check. Failed runs are never suppressed (their file
+    // holds no failure marker; failures stay loud).
     if (r.status === "completed" && shouldSuppressRead(r, delegateNotifyIfRead)) {
       applyReadSuppression(r, r.runId);
       return false;
@@ -922,49 +1023,36 @@ export function flushDelegateNotifications(): void {
     }
   }
   if (deliverable.length === 0) return;
+  const mode = delegateDisplayUsage;
+  let text: string;
+  let covered: DelegateRun[] = [];
   if (deliverable.length === 1) {
     const r = deliverable[0]!;
-    const mode = delegateDisplayUsage;
-    const injected = injectResult(
-      pi,
-      r.agent,
-      r.runId,
-      r.task,
-      r.status,
-      r.result?.code ?? null,
-      r.result?.file ?? "",
-      r.timedOut,
-      r.usage,
-      mode,
-      r.usageReported,
+    const built = buildInjectText(
+      r.agent, r.runId, r.task, r.status,
+      r.result?.code ?? null, r.result?.file ?? "", r.timedOut,
+      r.usage, mode, r.usageReported,
       r.status === "failed" ? r.result?.body : undefined,
       r.status === "failed" ? r.activityFile : undefined,
       r.exitSignal,
     );
-    if (r.usage && !r.usageReported && (mode === "separate" || injected)) r.usageReported = true;
-    r.injected = injected;
-    return;
+    text = built.text;
+    covered = built.covered;
+  } else {
+    for (const r of deliverable) {
+      if (mode === "separate" && r.usage && !r.usageReported) addDelegateUsage(r.usage);
+    }
+    text = buildBatchText(deliverable, mode, (r) => queued.has(r));
   }
-  const mode = delegateDisplayUsage;
-  const failedCount = deliverable.filter((r) => r.status === "failed").length;
-  const okCount = deliverable.length - failedCount;
-  const lost = deliverable.filter((r) => !queued.has(r));
-  const parts: string[] = [];
-  if (lost.length > 0) {
-    parts.push(`⚠️ Recovery notice: ${lost.length} earlier delegate result${lost.length === 1 ? "" : "s"} never reached you (notification delivery failed); included below.`);
-  }
-  parts.push(`[acp_delegate] ${deliverable.length} delegates finished (${okCount} completed${failedCount > 0 ? `, ${failedCount} FAILED` : ""}).`);
-  for (const r of deliverable) parts.push(formatBatchRunSection(r));
-  for (const r of deliverable) {
-    if (mode === "separate" && r.usage && !r.usageReported) addDelegateUsage(r.usage);
-  }
-  parts.push(buildBatchTrailer(deliverable, failedCount > 0, mode));
-  const text = parts.join("\n\n");
   const send = pi.sendUserMessage;
   let sent = false;
   if (typeof send === "function") {
     try {
-      send.call(pi, text, { deliverAs: "followUp" });
+      // Steering, not follow-up (#2320): a follow-up parked here would wait for
+      // the WHOLE task to end before reaching the model; steering is consumed at
+      // the next safe boundary of the current task — which, at the idle tier, is
+      // immediately (an idle host starts a turn right away).
+      send.call(pi, text, { deliverAs: "steer" });
       sent = true;
     } catch (err) {
       logError("delegate", { event: "notify-batch-error", error: String(err), runIds: deliverable.map((r) => r.runId).join(",") });
@@ -972,12 +1060,15 @@ export function flushDelegateNotifications(): void {
   } else {
     logWarn("delegate", { event: "notify-batch-skipped", reason: "sendUserMessage unavailable" });
   }
+  if (sent) {
+    for (const r of deliverable) r.injected = true;
+    for (const c of covered) c.injected = true;
+  }
   for (const r of deliverable) {
-    if (sent) r.injected = true;
     if (r.usage && !r.usageReported && (mode === "separate" || sent)) r.usageReported = true;
   }
-  debug.event("delegate-notify-batch", { count: deliverable.length, failed: failedCount, sent, runIds: deliverable.map((r) => r.runId).join(",") });
-  logInfo("delegate", { event: "notify-batch", count: deliverable.length, failed: failedCount, sent });
+  debug.event("delegate-notify-batch", { count: deliverable.length, failed: deliverable.filter((r) => r.status === "failed").length, sent, runIds: deliverable.map((r) => r.runId).join(",") });
+  logInfo("delegate", { event: "notify-batch", count: deliverable.length, failed: deliverable.filter((r) => r.status === "failed").length, sent });
 }
 
 /** One per-run section of a batched notification: status header + task +
@@ -988,6 +1079,25 @@ export function formatBatchRunSection(run: DelegateRun): string {
   const timeoutNote = run.timedOut ? ` (timed out: ${run.timedOut})` : "";
   const header = `[acp_delegate ${status}] **${run.agent}** (runId \`${run.runId}\`, ${exitLabel(run.result?.code ?? null, run.exitSignal)})${timeoutNote}`;
   return formatPayload(header, run.result?.file ?? "", run.task, failed ? run.result?.body : undefined, failed ? run.activityFile : undefined);
+}
+
+/** Build the merged multi-run notification text. `fromQueue` distinguishes
+ *  freshly queued runs from earlier undelivered ones folded in for recovery
+ *  (those get the recovery header). Usage accounting stays with the caller,
+ *  which must accumulate BEFORE calling (the trailer shows the cumulative total
+ *  including this batch). */
+function buildBatchText(deliverable: DelegateRun[], mode: "merged" | "separate", fromQueue: (r: DelegateRun) => boolean): string {
+  const failedCount = deliverable.filter((r) => r.status === "failed").length;
+  const okCount = deliverable.length - failedCount;
+  const lost = deliverable.filter((r) => !fromQueue(r));
+  const parts: string[] = [];
+  if (lost.length > 0) {
+    parts.push(`⚠️ Recovery notice: ${lost.length} earlier delegate result${lost.length === 1 ? "" : "s"} never reached you (notification delivery failed); included below.`);
+  }
+  parts.push(`[acp_delegate] ${deliverable.length} delegates finished (${okCount} completed${failedCount > 0 ? `, ${failedCount} FAILED` : ""}).`);
+  for (const r of deliverable) parts.push(formatBatchRunSection(r));
+  parts.push(buildBatchTrailer(deliverable, failedCount > 0, mode));
+  return parts.join("\n\n");
 }
 
 function buildBatchTrailer(batch: DelegateRun[], anyFailed: boolean, mode: "merged" | "separate"): string {
@@ -1898,11 +2008,15 @@ function suppressIfReadNow(run: DelegateRun): void {
   if (run.status === "completed" && shouldSuppressRead(run, delegateNotifyIfRead)) applyReadSuppression(run, run.runId);
 }
 
-/** status (set by finalize from the effective exit code) is the authority for
+/** Build the single-run notification text WITHOUT sending: status header +
+ *  remaining-count line + usage note + payload, plus a trailing recovery notice
+ *  for earlier undelivered runs (returned as `covered` so the caller commits
+ *  their marking only once ITS delivery succeeds). Separate-mode usage
+ *  accumulation happens here because the cumulative line must include this run.
+ *  status (set by finalize from the effective exit code) is the authority for
  *  the FAILED/completed decision; the raw code is diagnostic display only
  *  ("exit ?"), so the notification can never disagree with run.status. */
-export function injectResult(
-  pi: ExtensionAPI,
+function buildInjectText(
   agent: string,
   runId: string,
   task: string,
@@ -1916,13 +2030,7 @@ export function injectResult(
   body?: string,
   activityFile?: string,
   signal?: NodeJS.Signals | null,
-): boolean {
-  const send = pi.sendUserMessage;
-  if (typeof send !== "function") {
-    debug.event("delegate-inject-skipped", { runId, reason: "sendUserMessage unavailable" });
-    logWarn("delegate", { event: "inject-skipped", runId, reason: "sendUserMessage unavailable" });
-    return false;
-  }
+): { text: string; covered: DelegateRun[] } {
   const failed = status === "failed";
   const statusLabel = failed ? "FAILED ⚠️" : "completed";
   // Tell the model how many other delegates are still running, so it doesn't
@@ -1974,11 +2082,40 @@ export function injectResult(
   const header = `[acp_delegate ${statusLabel}] **${agent}** (runId \`${runId}\`, ${exitLabel(code, signal)})${timeoutNote}${remainingLine}${usageNote} ${closing}`;
   const { text: recoveryText, covered } = buildRecoveryNotice(Array.from(runs.values()), runId);
   const text = formatPayload(header, file, task, failed ? body : undefined, failed ? activityFile : undefined) + (recoveryText ? `\n\n${recoveryText}` : "");
+  return { text, covered };
+}
+
+/** Send a single-run notification via the host's message channel (idle tier /
+ *  direct callers). Returns true only once the host accepted the message; on
+ *  failure nothing is marked delivered so a later carrier recovers it. */
+export function injectResult(
+  pi: ExtensionAPI,
+  agent: string,
+  runId: string,
+  task: string,
+  status: RunStatus,
+  code: number | null,
+  file: string,
+  timedOut?: string,
+  usage?: Usage,
+  mode: "merged" | "separate" = "separate",
+  usageAlreadyReported?: boolean,
+  body?: string,
+  activityFile?: string,
+  signal?: NodeJS.Signals | null,
+): boolean {
+  const send = pi.sendUserMessage;
+  if (typeof send !== "function") {
+    debug.event("delegate-inject-skipped", { runId, reason: "sendUserMessage unavailable" });
+    logWarn("delegate", { event: "inject-skipped", runId, reason: "sendUserMessage unavailable" });
+    return false;
+  }
+  const { text, covered } = buildInjectText(agent, runId, task, status, code, file, timedOut, usage, mode, usageAlreadyReported, body, activityFile, signal);
   try {
-    // sendUserMessage is fire-and-forget (returns void): it enqueues a
-    // follow-up turn. Interactive/rpc sessions consume it via their main loop;
-    // injection at shutdown is best-effort (no API to await a turn).
-    send.call(pi, text, { deliverAs: "followUp" });
+    // Steering, not follow-up (#2320): a follow-up parked here would wait out
+    // the whole task before reaching the model; steering is consumed at the
+    // next safe boundary (immediately when the host is idle).
+    send.call(pi, text, { deliverAs: "steer" });
     // Commit the recovery marking only now: a thrown send above must leave the
     // covered runs undelivered so a later carrier can still recover them.
     for (const r of covered) r.injected = true;

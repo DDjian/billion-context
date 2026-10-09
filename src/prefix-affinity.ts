@@ -632,6 +632,28 @@ export class PrefixAffinityResolver {
         return best ? { sessionId: best.sessionId, sharedDepth: best.sharedDepth } : null;
     }
 
+    /** #2408: the DECLARED-parent variant of findResumeParent — an explicit
+     * lineage declaration (claude --fork-session SessionStart register,
+     * opencode derived register) scopes the content match to that parent's
+     * chain only, killing the multi-chain ambiguity the unscoped scan
+     * refuses to guess on. Same head-anchored byte-exact judgement as
+     * findResumeParent (strictly deeper than the parent, >=
+     * MIN_RESUME_PREFIX). Null when the parent chain is untracked or its
+     * replay does not match — the caller then falls back to the read-only
+     * derived link (#1333). */
+    findResumeParentWithin(parentId: string, messages: unknown[], selfSessionId: string): { sessionId: string; sharedDepth: number } | null {
+        if (parentId === selfSessionId) return null;
+        const entry = this.trackedChains.get(parentId);
+        if (entry === undefined || entry.depth < MIN_RESUME_PREFIX) return null;
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return null;
+        const hashes = chainHashes(msgs);
+        if (hashes.length < MIN_RESUME_PREFIX) return null;
+        if (msgs.length <= entry.depth) return null;
+        if (hashes[entry.depth - 1] !== entry.tailHash) return null;
+        return { sessionId: parentId, sharedDepth: entry.depth };
+    }
+
     /** #2241: does `messages` continue the tracked chain of `sessionId`?
      * True when the session's stored chain is a byte-exact head-anchored
      * prefix of the incoming list — the progressive hash at the stored

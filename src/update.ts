@@ -1548,6 +1548,7 @@ async function bootSmoke(installDir: string, env: NodeJS.ProcessEnv): Promise<st
             cwd: installDir,
             env: childEnv,
             stdio: ["ignore", "ignore", "pipe"],
+            windowsHide: true,
         });
         let stderr = "";
         child.stderr?.on("data", (chunk: Buffer) => {

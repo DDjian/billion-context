@@ -223,3 +223,16 @@ test("sanitizeResponsesInputIds rewrites over-long ids deterministically and hea
     sanitizeResponsesInputIds("not-an-array" as unknown as unknown[]);
     assert.ok(true, "non-array input tolerated");
 });
+
+test("sanitizeResponsesInputIds heals marker- message ids minted before WC-015", () => {
+    const input = [
+        { type: "message", id: "marker-1791393957942-2", role: "assistant", content: [{ type: "output_text", text: "[ACP] marker" }] },
+        { type: "message", id: "msg_short_ok", role: "assistant", content: [] },
+        { type: "reasoning", id: "rs_1" },
+    ];
+    sanitizeResponsesInputIds(input);
+    const [marker, providerMessage, providerReasoning] = input as Array<Record<string, unknown>>;
+    assert.ok(!("id" in marker), "legacy marker id is dropped so the upstream replays the full message");
+    assert.equal(providerMessage.id, "msg_short_ok", "provider message ids still pass through byte-identical (#1474)");
+    assert.equal(providerReasoning.id, "rs_1", "provider reasoning ids untouched");
+});

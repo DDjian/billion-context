@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore } from "../src/compress.js";
+import { validateConfig } from "../src/config.js";
 import { createInitialState } from "../src/state.js";
 import type { Config, CoreMessage } from "../src/types.js";
 
@@ -623,6 +624,183 @@ test("arbitration: non-emergency T2 large but T1 effective >= threshold → tier
     turn.nudge.tier,
     1,
     "T1 effective >= threshold wins even when T2 is large",
+  );
+});
+
+// Per-tier thresholds (#2376): nudge.tierGrowthTokens.{t1,t2,t3} pin each
+// mass trigger independently; unset tiers keep their derived defaults.
+// Mass model here: each makeMessages message ≈ 5000 tokens (20000 chars / 4);
+// block summary mass = summaryChars / 4. Derived defaults under buildConfig:
+// T1 = 6000, T2/T3 = 9000 (1.5x).
+
+test("tier thresholds: lowered t2 fires T2 below the derived 1.5x mass", () => {
+  const core = createCore();
+  const base = buildConfig({
+    compress: {
+      minCompressRange: 5000,
+      maxSummaryLength: 0,
+      minSummaryLength: 0,
+    },
+    // Preserve 9 → only m0 (~5000 tokens) is T1-effective, below the T1 bar.
+    preserveRecentMessages: 9,
+  });
+  const messages = makeMessages(10);
+
+  // One tier-1 block, summary 28000 chars → T2 mass 7000: above T1 effective
+  // (5000) but BELOW the derived 9000 → default config must not inject.
+  let state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config: base,
+    tokenCount: 50000,
+  }).state;
+  state = { ...state, blocks: t1Blocks([["m1"]], 28000) };
+  const defaultTurn = core.processTurn({
+    messages,
+    state,
+    config: base,
+    tokenCount: 60000,
+  });
+  assert.equal(
+    defaultTurn.nudge.shouldInject,
+    false,
+    "default: T2 mass 7000 < derived 9000 → no nudge",
+  );
+
+  // Same state, t2 pinned to 6000: 7000 >= 6000 and > T1 effective → tier 2.
+  const lowered = buildConfig({
+    ...base,
+    nudge: { ...base.nudge, tierGrowthTokens: { t2: 6000 } },
+  });
+  state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config: lowered,
+    tokenCount: 50000,
+  }).state;
+  state = { ...state, blocks: t1Blocks([["m1"]], 28000) };
+  const turn = core.processTurn({
+    messages,
+    state,
+    config: lowered,
+    tokenCount: 60000,
+  });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(turn.nudge.tier, 2, "lowered t2 lets T2 distill early");
+});
+
+test("tier thresholds: raised t1 suppresses T1 while nothing else is ready", () => {
+  const core = createCore();
+  const base = buildConfig({
+    compress: {
+      minCompressRange: 5000,
+      maxSummaryLength: 0,
+      minSummaryLength: 0,
+    },
+  });
+  const messages = makeMessages(10);
+  // All 10 messages visible → T1 effective ~50000 tokens.
+  let state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config: base,
+    tokenCount: 10000,
+  }).state;
+  const defaultTurn = core.processTurn({
+    messages,
+    state,
+    config: base,
+    tokenCount: 55000,
+  });
+  assert.equal(defaultTurn.nudge.shouldInject, true);
+  assert.equal(defaultTurn.nudge.tier, 1, "default: T1 ~50K >= 6000");
+
+  // Pin t1 above the ready mass → no tier has enough → no injection.
+  const raised = buildConfig({
+    ...base,
+    nudge: { ...base.nudge, tierGrowthTokens: { t1: 100000 } },
+  });
+  state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config: raised,
+    tokenCount: 10000,
+  }).state;
+  const turn = core.processTurn({
+    messages,
+    state,
+    config: raised,
+    tokenCount: 55000,
+  });
+  assert.equal(
+    turn.nudge.shouldInject,
+    false,
+    "raised t1: T1 ~50K < 100000 and no T2/T3 blocks → suppressed",
+  );
+});
+
+test("tier thresholds: pinning one tier leaves the others on derived defaults", () => {
+  const core = createCore();
+  const config = buildConfig({
+    compress: {
+      minCompressRange: 5000,
+      maxSummaryLength: 0,
+      minSummaryLength: 0,
+    },
+    preserveRecentMessages: 9,
+    // Only t1 pinned (high); t2 stays on its derived 1.5x threshold.
+    nudge: { ...buildConfig().nudge, tierGrowthTokens: { t1: 100000 } },
+  });
+  const messages = makeMessages(10);
+  let state = createInitialState();
+  state = core.processTurn({
+    messages,
+    state,
+    config,
+    tokenCount: 50000,
+  }).state;
+  // Two tier-1 blocks → T2 mass 12000 >= derived 9000 and > T1 effective.
+  state = { ...state, blocks: t1Blocks([["m1"], ["m2"]], 24000) };
+  const turn = core.processTurn({
+    messages,
+    state,
+    config,
+    tokenCount: 60000,
+  });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(
+    turn.nudge.tier,
+    2,
+    "unset t2 keeps the derived 1.5x threshold despite t1 being pinned",
+  );
+});
+
+test("validateConfig: nudge.tierGrowthTokens values must be positive numbers", () => {
+  const base = buildConfig();
+  assert.deepEqual(validateConfig(base), []);
+  for (const bad of [0, -1, NaN, Infinity]) {
+    const cfg = {
+      ...base,
+      nudge: { ...base.nudge, tierGrowthTokens: { t2: bad } },
+    };
+    assert.ok(
+      validateConfig(cfg).some((e) =>
+        e.includes("nudge.tierGrowthTokens.t2"),
+      ),
+      `expected an error for t2=${String(bad)}`,
+    );
+  }
+  const ok = {
+    ...base,
+    nudge: { ...base.nudge, tierGrowthTokens: { t1: 1 } },
+  };
+  assert.ok(
+    !validateConfig(ok).some((e) => e.includes("tierGrowthTokens")),
+    "valid value produces no tierGrowthTokens error",
   );
 });
 

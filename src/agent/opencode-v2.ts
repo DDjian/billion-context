@@ -50,6 +50,7 @@
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { createForkAdopter } from "./fork-adopt.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Under the cap, panels go to description verbatim;
@@ -262,6 +263,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         // data.sessionID + optional data.parentID); each derived sid is then
         // identity-registered once by its first stamped request. Fire-and-forget
         // with per-sid cooldown after failure; root sessions never report.
+        // #2399 stage 3: fork-child adoption. derivedParent (below) is the
+        // parent-declaration source; the http.request hook is the only V2 seam
+        // that sees BOTH the owning session id and the outgoing body. The
+        // prefix match inside tryForkAdoption is the "child truly replays the
+        // parent's history" gate #2394 requires for opencode — persona ids
+        // (#1102) that mint fresh contexts never match a parent prefix, so
+        // N=0 and no fork is posted. V1 (chat.headers only, no body seam)
+        // stays on the read-only derived register. The fire-and-forget
+        // identity register in reportDerived may claim the child id first —
+        // the proxy's fork endpoint tolerates a same-parent claim (#2399 B).
+        const forkAdopter = createForkAdopter((line) => console.error(`[bili-opencode] ${line}`));
         const derivedParent = new Map<string, string>();
         const derivedReported = new Map<string, "pending" | "done">();
         const derivedRetryAt = new Map<string, number>();
@@ -330,6 +342,23 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (!state.proxyBase) return;
             refreshWindows(ctx, state);
             stampHeaders(e);
+            // #2399 stage 3: adopt the fork child before its first request
+            // reaches the proxy (see the forkAdopter comment above).
+            const forkChild = typeof e.sessionID === "string" ? e.sessionID : "";
+            const forkParent = derivedParent.get(forkChild);
+            if (forkChild.length > 0 && forkParent !== undefined && state.proxyBase) {
+                let forkBody: unknown;
+                try {
+                    // The structural type cannot know the runtime shape; opencode
+                    // hands the hook a real fetch Request (probed on 2.0.x), and
+                    // every other shape (ws handshake's synthetic request) skips.
+                    const req = e.request as Request | undefined;
+                    forkBody = typeof req?.clone === "function" ? await req.clone().json() : undefined;
+                } catch {
+                    forkBody = undefined;
+                }
+                await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkParent, child: forkChild, body: forkBody });
+            }
         };
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);

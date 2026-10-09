@@ -432,7 +432,10 @@ function mockCtx() {
     // agent's session id); tests call them with or without it to cover both paths.
     type CmdInvocation = { agent?: { session?: { id?: unknown } } };
     const commands: Array<{ name: string; handler: (invocation?: CmdInvocation) => Promise<{ kind: string; text: string }> }> = [];
-    let initiator: { session?: { id?: unknown } } | undefined = undefined;
+    // #2381: the initiator's session may carry the dsh-session requestHeader()
+    // surface (the EpochHeader of the request being fetched); mocks omit it to
+    // model older hosts and set it to drive session-scoped model targeting.
+    let initiator: { session?: { id?: unknown; requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } } | undefined = undefined;
     // #955 runtime-info sources: tests can attach llm/agentDefaultModel and
     // replay them through the same dynamic ctx.inject path production uses.
     let llm: { resolveModelInfo?: (provider: string, model: string) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> } | undefined = undefined;
@@ -444,7 +447,7 @@ function mockCtx() {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
         commands: { register: (c: { name: string; handler: (invocation?: { agent?: { session?: { id?: unknown } } }) => Promise<{ kind: string; text: string }> }) => commands.push(c) },
         agents: { currentInitiator: () => initiator },
-        setInitiator: (i: { session?: { id?: unknown } } | undefined) => (initiator = i),
+        setInitiator: (i: { session?: { id?: unknown; requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
         inject: (deps: readonly string[], callback: (sub: HostCtx) => void) => {
@@ -1018,6 +1021,141 @@ test("apply() runtime-info (#1942): binds resolveModelInfo to its service receiv
             await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "1000000", "bound resolve stamped the context-window header");
             assert.equal(stamp()?.["x-bili-plugin-model"], "space-bunny");
             assert.equal(stamp()?.["x-bili-plugin-max-output"], "32768");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #2381: the stamped model/window must follow the SESSION's actual routing,
+// not the host's GLOBAL default selection. Pre-fix, a session on a non-default
+// model stamped the default model's name + window; the proxy's exact-match
+// gate then discarded the whole header channel and the session sized itself
+// against the unconfigured fallback window. dsh-agent-loop writes each step's
+// header into the session log before its fetch, so requestHeader() at fetch
+// time IS this request's routing.
+test("apply() runtime-info (#2381): stamps the session's own model/window from its live request header, not the global default", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-sess-model-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            const resolved: Array<{ provider: string; model: string }> = [];
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async (provider, model) => {
+                        resolved.push({ provider, model });
+                        if (model === "swift-local") return { context: { contextWindow: 240000 }, defaultMaxTokens: 4096 };
+                        return { context: { contextWindow: 111111 }, defaultMaxTokens: 8192 };
+                    },
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "global-default" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (sess-model)");
+            // the session routes to a DIFFERENT model than the global default
+            ctx.setInitiator({
+                session: {
+                    id: "session-sess-model",
+                    requestHeader: () => ({ config: { provider: "local", model: "swift-local" } }),
+                },
+            });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "240000", "the session model's window was stamped");
+            const headers = stamp();
+            assert.notEqual(headers, undefined);
+            assert.equal(headers?.["x-bili-plugin-conversation"], "session-sess-model");
+            assert.equal(headers?.["x-bili-plugin-model"], "swift-local");
+            assert.equal(headers?.["x-bili-plugin-context-window"], "240000");
+            assert.equal(headers?.["x-bili-plugin-max-output"], "4096");
+            assert.ok(resolved.some((r) => r.provider === "local" && r.model === "swift-local"), "the SESSION model was resolved");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() runtime-info (#2381): per-key cache — switching sessions re-stamps each model's own numbers without re-resolving", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-perkey-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            let callsA = 0;
+            let callsB = 0;
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async (_provider, model) => {
+                        if (model === "swift-a") {
+                            callsA += 1;
+                            return { context: { contextWindow: 111111 } };
+                        }
+                        callsB += 1;
+                        return { context: { contextWindow: 222222 }, defaultMaxTokens: 2048 };
+                    },
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "global-default" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (perkey)");
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            ctx.setInitiator({ session: { id: "sess-a", requestHeader: () => ({ config: { provider: "local", model: "swift-a" } }) } });
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "111111", "A's window stamped");
+            assert.equal(stamp()?.["x-bili-plugin-model"], "swift-a");
+            // switch to another session on another model — never A's numbers
+            ctx.setInitiator({ session: { id: "sess-b", requestHeader: () => ({ config: { provider: "local", model: "swift-b" } }) } });
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "222222", "B's window stamped");
+            assert.equal(stamp()?.["x-bili-plugin-model"], "swift-b");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "2048");
+            assert.equal(stamp()?.["x-bili-plugin-conversation"], "sess-b");
+            const aCalls = callsA;
+            const bCalls = callsB;
+            // back to A: re-stamped from its OWN cached key, not re-resolved
+            ctx.setInitiator({ session: { id: "sess-a", requestHeader: () => ({ config: { provider: "local", model: "swift-a" } }) } });
+            await new Promise((r) => setTimeout(r, 20));
+            assert.equal(stamp()?.["x-bili-plugin-model"], "swift-a");
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], "111111");
+            assert.equal(callsA, aCalls, "switching back did not re-resolve A");
+            assert.equal(callsB, bCalls, "switching back did not re-resolve B");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() runtime-info (#2381): a missing or throwing session requestHeader falls back to the global default selection", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-fallback-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async () => ({ context: { contextWindow: 111111 }, defaultMaxTokens: 8192 }),
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "global-default" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (fallback)");
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // older host shape: session without requestHeader at all
+            ctx.setInitiator({ session: { id: "sess-old" } });
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "111111", "the fallback stamped the global default's window");
+            assert.equal(stamp()?.["x-bili-plugin-model"], "global-default");
+            assert.equal(stamp()?.["x-bili-plugin-conversation"], "sess-old");
+            // disposed/closing scope: requestHeader throws — same fallback, no crash
+            ctx.setInitiator({ session: { id: "sess-throws", requestHeader: () => { throw new Error("disposed"); } } });
+            assert.equal(stamp()?.["x-bili-plugin-model"], "global-default");
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], "111111");
         });
     } finally {
         proxy.close();

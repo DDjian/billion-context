@@ -202,12 +202,12 @@ entries:
     desc_zh: "GC 清扫间隔。"
   - key: plugin.snapshotCapBytes
     type: number
-    default: "16777216 (0 disables snapshots)"
+    default: "104857600 (0 disables snapshots)"
     env: BILI_PUBLIC_SNAPSHOT_CAP_BYTES
     group: process
     id: tt.snap
     site_group: proc
     desc_en: "Size cap for fork-API public snapshots served to native plugins."
     desc_zh: "提供给原生插件的 fork API 公共快照大小上限。"
-    site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 16 MiB; 0 disables snapshots)."
-    site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 16 MiB；0 禁用快照）。"
+    site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots)."
+    site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 100 MiB；0 禁用快照）。"

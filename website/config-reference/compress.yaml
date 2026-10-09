@@ -52,6 +52,16 @@ entries:
     desc_zh: "增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。"
     site_en: "Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens."
     site_zh: "增长门槛（默认 50000）：可折叠片段超出基线增长达到该 token 数才发提醒。"
+  - key: compress.tierNudgeTokens
+    type: "object {t1?, t2?, t3?}"
+    default: "derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5)"
+    group: compress
+    id: cw.tnt
+    render: compress-row
+    desc_en: "Per-tier token-mass trigger thresholds; each unset tier falls back to its derived default, so absent/empty = legacy unified behavior (#2376)."
+    desc_zh: "分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。"
+    site_en: "Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5)."
+    site_zh: "T1/T2/T3 路径的分层 token 质量触发阈值；未设置的子字段保持派生值（T1＝增长步长，T2/T3＝步长 × 1.5）。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"

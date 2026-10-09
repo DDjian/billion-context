@@ -14,6 +14,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
+import { createForkAdopter } from "./fork-adopt.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -425,7 +426,24 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
-                const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                // #2416: read the LIVE base — a native respawn after a proxy
+                // death moves the origin (the interceptor rewrites
+                // BILLION_CONTEXT_PROXY), and a captured base would keep
+                // firing at a dead port for the whole session while the model
+                // channel recovers on its next dispatch. Same precedence as
+                // registration (baseUrl /bili/ first, env second); the
+                // captured value stays as fallback when nothing resolves.
+                // baseUrl-first is deliberate for /bili/-wrapped baseUrls too:
+                // wrapped URLs pin the model channel to their baked origin
+                // (#1365) — a replacement instance can never carry them, and
+                // recovery WAITS for the pinned origin instead of moving
+                // traffic (verifyAttachAndRecover) — so env-first would split
+                // tools onto an instance that lacks the conversation. Any
+                // env divergence in that shape is transient: the intercept
+                // rebinding (onRoutedOriginObserved) converges env back to the
+                // observed routed origin.
+                const base = proxyBaseForCtx(ctx) ?? proxyBase;
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
@@ -988,6 +1006,30 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             const sid = sessionIdOf(ctx);
             await reportRuntimeInfoOnChange(proxyBase, { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, ...(sid !== undefined && sid.length > 0 ? { conversationId: sid } : {}), source: "client-config" });
         }
+        // #2399 stage 2: fork-child adoption for pi (/fork, /clone, --fork)
+        // and omp (fork()). A child session's header declares parentSession;
+        // its first model request replays the parent history, so BEFORE that
+        // request lands we adopt the parent's compression state through the
+        // plugin fork protocol — otherwise the replay arrives as a fresh
+        // conversation and preflight refolds everything from scratch (#2383).
+        // The once-per-sid / retry-cap / single-flight bookkeeping lives in
+        // the shared coordinator; the per-sid parent cache avoids re-reading
+        // the parent session file (64KB sync read in parentConversationIdOf)
+        // on every model request.
+        const forkAdopter = createForkAdopter((line) => console.error(`bili-plugin(${agent}): ${line}`));
+        const forkParents = new Map<string, string | undefined>();
+        async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
+            if (state.toolsReady !== true) return;
+            const sid = sessionIdOf(ctx);
+            if (sid === undefined || sid.length === 0) return;
+            if (!forkParents.has(sid)) forkParents.set(sid, parentConversationIdOf(ctx));
+            const parent = forkParents.get(sid);
+            if (parent === undefined || parent === "" || parent === sid) return;
+            let proxyBase = proxyBaseForCtx(ctx);
+            if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
+            if (proxyBase === undefined) return;
+            await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
+        }
         pi.on("before_provider_request", async (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
@@ -1016,6 +1058,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 } catch (err) {
                     console.error(`bili-plugin(omp): runtime-info report failed (${err instanceof Error ? err.message : String(err)}) — riding legacy window resolution`);
                 }
+            }
+            // #2399 stage 2: adoption must win the race with the child's first
+            // stamped request (which would create the conversation and close
+            // the window), so it rides the same awaited pre-send slot — after
+            // registerTools (plugin claim) but before the payload returns.
+            try {
+                await maybeAdoptForkChild(event, ctx);
+            } catch (err) {
+                console.error(`bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
             }
             return stampPromptCacheKey(event, ctx, agent);
         });

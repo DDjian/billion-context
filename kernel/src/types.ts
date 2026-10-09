@@ -284,6 +284,16 @@ export interface CompressionState {
    *  this set and keeps the clear "cannot be anchored" error. Optional for
    *  pre-feature persisted states. */
   hiddenOrphanRefs?: string[];
+  /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
+   *  backing no visible or folded message — the client rewrote or dropped those
+   *  messages (an edit reissues a new ref; a host-native compaction or bulk
+   *  history rewrite drops them outright), so no range citing them can ever
+   *  compress. Marked by applyCompression when a requested endpoint dangles;
+   *  a tombstone lifts automatically once the ref's message reappears in an
+   *  inbound view (processTurn / applyCompression). The refs themselves are
+   *  NEVER removed from messageRefs (Kernel Contract: ids are never re-issued).
+   *  Optional: pre-feature persisted states lack it. */
+  deadRefs?: string[];
   /** Exact inbound ids of the PREVIOUS processTurn pass (pre-pipeline,
    * converter-derived). Continuity signal for reconcile-live-ids (#462): an
    * id that is covered by a fold but was present in the prior pass is the
@@ -330,6 +340,14 @@ export interface NudgeConfig {
    *  pending ≥ nudgeGrowthTokens × this multiplier AND T2 > T1 effective.
    *  Default 1.5. */
   tier2GrowthMultiplier: number;
+  /** Per-tier growth thresholds in tokens (#2376): independent trigger sizes
+   *  for the T1/T2/T3 token-mass paths. Each UNSET tier falls back to the
+   *  derived default (T1 = resolved nudgeGrowthTokens, T2/T3 =
+   *  nudgeGrowthTokens × tier2GrowthMultiplier), so an absent or empty object
+   *  is fully backward compatible. Only the token-mass trigger comparisons
+   *  change — count triggers, cadence floor, first-sight mass bypass and the
+   *  pressure/emergency routing keep their existing bases. */
+  tierGrowthTokens?: { t1?: number; t2?: number; t3?: number };
   /** Minimum tokens the pressure band (usage ≥ maxContextLimitPct /
    *  emergencyThresholdPct) must be able to reclaim before injecting. Below
    *  this, the rewrite reclaims almost nothing while high usage keeps the

@@ -950,6 +950,28 @@ test("single undelivered run flushes through the legacy single-run format", () =
   assert.equal(a.injected, true);
 });
 
+test("completion notifications are injected as steering on both paths (#2320)", async () => {
+  const entries: Array<{ t: string; o?: { deliverAs?: string } }> = [];
+  const handlers = new Map<string, Array<(...a: unknown[]) => void>>();
+  const pi = {
+    sendUserMessage: (t: string, o?: { deliverAs?: string }) => void entries.push({ t, o }),
+    on: (ev: string, h: (...a: unknown[]) => void) => {
+      const list = handlers.get(ev) ?? [];
+      list.push(h);
+      handlers.set(ev, list);
+    },
+  } as any;
+  makeDelegateTool(pi);
+  for (const h of handlers.get("agent_start") ?? []) h({}); // busy: no idle-flush timer can fire
+  const ok = injectResult(pi, "reviewer", "del_steer", "review X", "completed", 0, "/tmp/del_steer.out", undefined, undefined, "separate", false);
+  assert.equal(ok, true, "single-path injection succeeds");
+  scheduleRunNotification(pi, mkRun("del_steer_a", "completed"));
+  scheduleRunNotification(pi, mkRun("del_steer_b", "failed"));
+  flushDelegateNotifications(pi);
+  assert.equal(entries.length, 2, "one single-path send + one merged batch send");
+  for (const e of entries) assert.deepEqual(e.o, { deliverAs: "steer" }, "steering delivery, not follow-up");
+});
+
 test("findUndeliveredRuns excludes queued runs (scheduled is not lost)", () => {
   const queued = mkRun("del_q", "completed", { notifyQueued: true });
   const lost = mkRun("del_lost", "failed");

@@ -44,6 +44,15 @@ export interface NativeInterceptState {
      *  mode exactly like pi.ts's before_provider_headers stamp. Returning
      *  undefined sends the request untouched (wire mode). */
     headersFor?: (url: string) => Record<string, string> | undefined;
+    /** #2399: async pre-send hook — awaited (defensively; a hook error never
+     *  breaks the request) per attributed model-API request after the tools
+     *  gate clears and BEFORE headersFor is consulted. dsh-native uses it to
+     *  adopt a fork child's parent state via the plugin fork protocol before
+     *  the child's first replayed request lands. Unlike headersFor it sees
+     *  the request init (body) and may spend async time; wire-mode requests
+     *  (headersFor returns nothing) still pass through it — the hook itself
+     *  gates on its own conditions. */
+    beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
     /** #1117: attribution gate — called synchronously per model-API request
      *  with the (pre-rewrite) target URL. Returning false means the caller is
      *  NOT the host itself (e.g. a third-party in-process plugin riding the
@@ -663,6 +672,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // reads the host's live tool-registration state, and evaluating
             // it pre-gate would freeze an un-stamped decision forever.
             await waitToolsGate();
+            if (state.beforeSend !== undefined) {
+                try {
+                    await state.beforeSend(url, init);
+                } catch (err) {
+                    console.error(`bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
+                }
+            }
             const routedExtra = state.headersFor?.(routedTarget);
             let target = url;
             const baked = new URL(url);
@@ -803,6 +819,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             return send(input, init);
         }
         await waitToolsGate();
+        if (state.beforeSend !== undefined) {
+            try {
+                await state.beforeSend(url, init);
+            } catch (err) {
+                console.error(`bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
+            }
+        }
         const first = makeTarget(`${origin}/bili/${url}`);
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {

@@ -41,16 +41,16 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Run real-pi native-lane compression E2E
+      - name: Run real-pi native-lane E2E (compression + delegate notification timing)
         env:
           E2E_PI_BIN: pi
-        run: ACP_TEST_E2E_NATIVE=1 node --import tsx --test tests/e2e/e2e-native-pi.test.ts
+        run: ACP_TEST_E2E_NATIVE=1 node --import tsx --test tests/e2e/e2e-native-pi.test.ts tests/e2e/e2e-delegate-notify.test.ts
 
       - name: Collect E2E artifacts
         if: failure()
         run: |
           mkdir -p tmp/e2e-artifacts
-          for d in tmp/e2e-native-pi-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+          for d in tmp/e2e-native-pi-* tmp/e2e-delegate-notify-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
 
       - uses: actions/upload-artifact@v4
         if: failure()

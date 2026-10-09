@@ -125,6 +125,13 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         lines.push("  [suspected] = name-only keyword match — verify the plugin actually compresses before acting; a context dashboard/viewer/tool is NOT a compressor.");
     }
     const allSuspected = suspectedCount > 0 && suspectedCount === events.length;
+    // #2432: a ledger pointing at the client's OWN native compaction landing is
+    // not "a second compressor fighting you" — commanding the model to hunt for
+    // and disable another plugin sends it on a useless errand (the incident
+    // model did exactly that). Only foreign CONFIRMED third-party events keep
+    // the one-compressor command; suspected names never do (#1736 tiering).
+    const foreignConfirmed = events.some((e) => e.kind === "third-party-plugin" && !isSuspectedEvent(e));
+    const nativePresent = events.some((e) => e.kind === "native-compaction");
     // #2261: a ledger naming ONLY bili's own siblings (billion-context-pi /
     // opencode-acp) is not a foreign-compressor alarm — they stand down while
     // bili drives the session (#820/#920), so never command removal for them.
@@ -136,7 +143,9 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
             ? "All events above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compression plugin is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : allSuspected
                 ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
-                : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+                : nativePresent && !foreignConfirmed
+                    ? "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation."
+                    : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
     // #2219: actionable per-client remediation — the surfaces used to stop at
     // WHAT happened; answering HOW required digging out four separate doc
     // locations, none linked from any conflict surface. Skipped for the #2261
@@ -163,6 +172,10 @@ interface ConflictSummary {
      *  opencode-acp) — display-time classification of recorded details, additive
      *  to `kinds`, so surfaces can stop calling first-party siblings "third-party". */
     sibling: number;
+    /** #2324: name-only [suspected] plugin events — a subset of kinds["third-party-plugin"],
+     *  additive, so display surfaces can stop treating unverified name matches as
+     *  confirmed compressors. Disjoint from `sibling` (siblings are never suspected). */
+    suspected: number;
     latest: Array<{ sessionId: string; at: number; kind: ConflictKind; detail: string }>;
     /** #2219: distinct resolved clients of sessions carrying events (first-seen
      *  order) — lets the web banner show per-client remediation hints. */
@@ -170,7 +183,7 @@ interface ConflictSummary {
 }
 
 export function summarizeConflicts(sessions: Session[], now: number = Date.now()): ConflictSummary {
-    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, clients: [] };
+    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, suspected: 0, clients: [] };
     for (const s of sessions) {
         const events = conflictEventsOf(s);
         if (events.length === 0) continue;
@@ -181,6 +194,7 @@ export function summarizeConflicts(sessions: Session[], now: number = Date.now()
         for (const e of events) {
             summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
             if (e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail)) summary.sibling += 1;
+            if (isSuspectedEvent(e)) summary.suspected += 1;
             if (now - e.at <= CONFLICT_ACTIVE_WINDOW_MS) summary.active += 1; else summary.historical += 1;
             if (summary.lastAt === null || e.at > summary.lastAt) summary.lastAt = e.at;
         }

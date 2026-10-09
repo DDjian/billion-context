@@ -27,6 +27,13 @@ interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-015",
+        wire: "responses",
+        summary: "a supplied message input item id must begin with msg",
+        provenance:
+            "#2374: user-reported production 400 on the ChatGPT Codex backend (Invalid 'input[59].id': 'marker-1791393957942-2'. Expected an ID that begins with 'msg'.) — the first ACP compression round emitted a visibility-marker message item minted with a 'marker-<ts>-<index>' id while emitText minted msg-proxy-; the client (pi-ai) encodes a message item id into the text block's textSignature and replays it on every later request, and the ingress heal recognized only the msg-proxy- namespace, so the poisoned session 400'd every turn. The prefix rule is the Codex backend's own validation, not a bili-specific one: the identical error is reported against Codex CLI-locally-synthesized ids (openai/codex#27928 'review_rollout_user', openai/codex#20783 a bare UUID), so any locally minted message item id must satisfy it.",
+    },
+    {
         id: "WC-013",
         wire: "responses",
         summary: "Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields",
@@ -248,6 +255,17 @@ export function validateResponsesBody(body: unknown): string[] {
             if (isPlainObject(item) && item.type === "compaction" && item.id !== undefined
                 && (typeof item.id !== "string" || !item.id.startsWith("cmp")))
                 out.push(`WC-012 input[${i}].id: expected an ID that begins with 'cmp'`);
+        });
+        // WC-015: message items validate their id prefix too — bili's
+        // visibility markers minted "marker-<ts>-<index>" until both emit
+        // paths were unified onto the msg-proxy- namespace.
+        body.input.forEach((item, i) => {
+            if (!isPlainObject(item)) return;
+            const isMessage = item.type === "message"
+                || (item.type === undefined && (item.role === "user" || item.role === "assistant"));
+            if (!isMessage || item.id === undefined) return;
+            if (typeof item.id === "string" && item.id.startsWith("msg")) return;
+            out.push(`WC-015 input[${i}].id: expected an ID that begins with 'msg'`);
         });
     }
     // WC-013 (#1757): runs before the tools early-return — reasoning.summary

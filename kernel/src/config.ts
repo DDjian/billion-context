@@ -122,6 +122,13 @@ export function validateConfig(config: Config): string[] {
   if (config.tiers.tier3Trigger <= config.tiers.tier2Trigger) {
     errors.push("tiers.tier3Trigger must be greater than tiers.tier2Trigger");
   }
+  if (config.nudge.tierGrowthTokens !== undefined) {
+    for (const [tier, value] of Object.entries(config.nudge.tierGrowthTokens)) {
+      if (value !== undefined && (!Number.isFinite(value) || value < 1)) {
+        errors.push(`nudge.tierGrowthTokens.${tier} must be a positive number`);
+      }
+    }
+  }
   if (
     config.neverPreserveRecentTools !== undefined &&
     (!Array.isArray(config.neverPreserveRecentTools) ||

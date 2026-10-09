@@ -11,6 +11,10 @@ export interface ProxyToolResult {
     text: string;
     outcome?: ToolOutcomeKind;
     blocksCreated?: number;
+    // #2362: short machine-readable failure cause for log correlation (e.g.
+    // `parse:missing-content`, `gate:cannot-anchor`) — outcome=refused alone
+    // never says WHY in the [plugin] execution line.
+    reason?: string;
 }
 
 export function toolOk(text: string): ProxyToolResult {
@@ -21,6 +25,6 @@ export function toolFail(text: string): ProxyToolResult {
     return { text, outcome: "failure" };
 }
 
-export function compressResult(text: string, outcome: CompressOutcomeKind, blocksCreated: number): ProxyToolResult {
-    return { text, outcome, blocksCreated };
+export function compressResult(text: string, outcome: CompressOutcomeKind, blocksCreated: number, reason?: string): ProxyToolResult {
+    return reason !== undefined ? { text, outcome, blocksCreated, reason } : { text, outcome, blocksCreated };
 }

@@ -153,7 +153,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC age threshold in days. |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC sweep interval. |
-| `plugin.snapshotCapBytes` | number | 16777216 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Size cap for fork-API public snapshots served to native plugins. |
+| `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Size cap for fork-API public snapshots served to native plugins. |
 
 **Updates & advisories**
 
@@ -201,6 +201,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
+| `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | Per-tier token-mass trigger thresholds; each unset tier falls back to its derived default, so absent/empty = legacy unified behavior (#2376). |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON "yes" injects an explicit directive with a program-finalized span; "no", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled. |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 "stream required" rejections and never arms on gateway timeouts. |
@@ -832,9 +833,9 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 ### `plugin`
 
 - **Type:** `{ snapshotCapBytes?: number }`
-- **Default:** `{ snapshotCapBytes: 16777216 }`
+- **Default:** `{ snapshotCapBytes: 104857600 }`
 - **Status:** ACTIVE
-- **Description:** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw wire-history snapshot retained per plugin session for the public fork API (`GET /__bili/plugin/snapshot`, `POST /__bili/plugin/fork`): when the serialized snapshot exceeds the cap, bili refuses to retain it — the session stops being forkable (snapshot/fork answer `409` with the capped reason) instead of retaining an unbounded raw copy on disk. Default `16 MiB`; `0` disables retention entirely (no session is forkable); twins `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
+- **Description:** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw wire-history snapshot retained per plugin session for the public fork API (`GET /__bili/plugin/snapshot`, `POST /__bili/plugin/fork`): when the serialized snapshot exceeds the cap, bili refuses to retain it — the session stops being forkable (snapshot/fork answer `409` with the capped reason) instead of retaining an unbounded raw copy on disk. Default `100 MiB`; `0` disables retention entirely (no session is forkable); twins `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
 
 ### `update`
 
@@ -1162,6 +1163,12 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
 
+#### `tierNudgeTokens`
+
+- **Type:** `object` — `{ "t1"?: number, "t2"?: number, "t3"?: number }` (each value in tokens, ≥ 1)
+- **Default:** *(unset — every tier uses its derived value)*
+- **Status:** ACTIVE (requires acp-kernel >= 0.0.108)
+- **Description:** Per-tier token-mass trigger thresholds for the T1/T2/T3 compression paths (#2376). By default all three tiers derive from `nudgeGrowthTokens` (T1 = the step, T2/T3 = step × 1.5); this field pins each tier independently — e.g. keep T1 aggressive for long tasks while letting T2 distill earlier or later. Each UNSET sub-field falls back to that tier's derived default, so an absent or empty object is fully backward compatible with the unified value. Only the token-mass trigger comparisons change: count triggers (`tiers.tier2Trigger` / `tiers.tier3Trigger`), the cadence floor, the first-sight mass bypass and pressure/emergency routing keep their existing bases. Merged PER SUB-FIELD across global → provider → model (a model-level `t2` does not discard a provider-level `t1`). Maps to the kernel field `nudge.tierGrowthTokens`.
 #### `nudgeModelDecided`
 
 - **Type:** `boolean`
@@ -1625,7 +1632,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 16777216 (0 disables snapshots) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (0 disables snapshots) |
 | `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
 | `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
 | `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | 1500 (0 disables the delay) |
@@ -1731,7 +1738,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | Re-alert window for the persist EPERM alert, in ms. `0` (default) = alert once then stay silent; `>0` = re-alert at most every that many ms while the failures continue. |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | `/bili/<absolute-url>` tunnel admission for **remote clients** (#409): comma-separated `host` or `host:port` entries that unlock loopback/private destinations (e.g. a LAN relay or the machine's own sglang) for non-loopback clients. The proxy itself and link-local/metadata addresses are always denied; local (loopback) clients always pass. |
 | `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | Retention cap (bytes) for the raw wire-history snapshot kept per plugin session to serve the public fork API (#2017). A plugin session whose serialized snapshot exceeds the cap stops being forkable — `GET /__bili/plugin/snapshot` and `POST /__bili/plugin/fork` fail closed with `409` and the capped reason — instead of retaining an unbounded raw copy of the history forever. The cap is re-evaluated on every plugin model request: a session that shrinks back under the cap (after a fork trimmed it, or the host shrank the history) resumes being forkable. Default `16777216` (16 MiB); `0` disables retention entirely (no session is forkable; existing snapshots are dropped on the next request). File twin: `plugin.snapshotCapBytes`. |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | Retention cap (bytes) for the raw wire-history snapshot kept per plugin session to serve the public fork API (#2017). A plugin session whose serialized snapshot exceeds the cap stops being forkable — `GET /__bili/plugin/snapshot` and `POST /__bili/plugin/fork` fail closed with `409` and the capped reason — instead of retaining an unbounded raw copy of the history forever. The cap is re-evaluated on every plugin model request: a session that shrinks back under the cap (after a fork trimmed it, or the host shrank the history) resumes being forkable. Default `104857600` (100 MiB); `0` disables retention entirely (no session is forkable; existing snapshots are dropped on the next request). File twin: `plugin.snapshotCapBytes`. |
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
 | `BILI_SESSION_GC` | Cleanup of stale session files (#1082) is **opt-in**: set to `1`/`true`/`on` to enable — off by default, because session files are user data (exportable, resumable) and there is no silent deletion policy. When enabled, the sweep (boot + hourly) deletes a file only when BOTH conditions hold: older than `BILI_SESSION_GC_MAX_AGE_DAYS`, AND small in the lossless sense — the session was **never compressed** (zero folded blocks) and its newest request body ≤ the token ceiling below, so resuming it costs one cold rebuild from the client's own history and nothing else. Safety rails: compressed sessions are NEVER deleted (their summaries cannot be rebuilt losslessly); a session still held in memory is skipped unless idle since its last disk write; unreadable/corrupt files are left in place; every deletion is audit-logged individually (path, size, age) plus one summary line per non-empty sweep; only the sessions dir is ever touched; emptied protocol subdirectories are removed. Note the resident guard is per-process: another proxy instance sharing `BILI_SESSIONS_DIR` that does not persist (e.g. `BILI_PERSIST=0`) never refreshes file mtimes, so its still-live session files can age out and be swept — the cost is the same bounded cold rebuild, backstopped by the age gate. CCR content stores (#1097) share the session's lifecycle (#1180): a `<hash>.content-store.json` companion is deleted together with its session file, an orphaned companion (session file already gone) is swept once past the age gate, and an unreadable companion keeps its session file too (never guessed at). |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | Minimum age (days) before a session file becomes a GC candidate (default `7`). Keep it far beyond any plausible resume window: after deletion a resumed session restarts message numbering from m00001 while a resuming agent's transcript may still cite old numbers (kernel contract: ids are never reused). |
@@ -2053,6 +2060,7 @@ Two compressors on one conversation double-compress and corrupt message refs, so
 - **Scan** (read-only, best-effort, 5-minute cache): opencode global + project config `plugin` arrays; pi global + project `.pi/settings.json` `packages`; omp `config.yml` `extensions`; claude settings `enabledPlugins`/`plugins` keys + `~/.claude/plugins/` dir; kimi `plugins/installed.json`; hermes `~/.hermes/plugins/` dir; dsh profile `package.json` dependencies. Two tiers: **known conflicts** (`opencode-acp`, legacy `billion-context-pi` — deterministic) and **keyword-suspected** entries (names matching compress / compact / acp / summar* / context*; bili's own entries are always skipped, non-compression tools like `context7` do not match).
 - **Where findings surface:** launcher stderr before the client starts; a proxy warn log on each session's first request (client identified from the `x-bili-plugin` header or wire headers); and the session's conflict ledger — `acp_status`'s `COMPRESSION CONFLICTS` section, `GET /__bili/stats` → `conflicts`, web-UI banner.
 - **Runtime evidence:** unannounced history rewrites (#1001) and orphan-gc deactivations (summarized content deleted out of the client's history) are recorded in the same ledger, so *suspected* coexistence and *observed* interference cross-check each other.
+- **dsh's `auto: false` disables only the automatic triggers.** The `compaction-basic: { auto: false }` line installed by the profile bundle patch (`dsh.bundle.patch.yml`) skips pressure/overflow auto-compaction — a manual `/compact` (and idle-session compaction) still fires. Calls routed through bili are refused by the server-side guard (#1729/#2360); calls that reach the provider without transiting bili (desktop-lane paths the plugin's takeover gate does not attribute) land, and bili detects them on the next replay — checkpoint framing + decimated fold coverage — rebasing its compression state in one turn instead of failing every later compress forever (#2432).
 - Under the opencode launcher/native mode a present `opencode-acp` is info-only by design (#920 absorbs it for legacy sessions); everywhere else it warns.
 - Disable: `BILI_CONFLICT_SCAN=0`.
 

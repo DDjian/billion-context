@@ -29,7 +29,7 @@ import {
 } from "../src/plugin-install.ts";
 import { ensureRootCA } from "../src/ca.ts";
 import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal } from "../src/config.ts";
-import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
+import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { claudeRoutingWarningFile } from "../src/paths.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -402,6 +402,16 @@ test("isClaudeHostArgv: exact matches only — never the hook itself or lookalik
 });
 
 // — ps / powershell process readers (non-linux fallback) ———————————————————
+
+// #2441: both readers below go through defaultExec — pin the shared options so
+// a future "simplification" cannot drop windowsHide (the PowerShell fallback is
+// the closest analog of the #2439 console flash; ps on POSIX is a no-op).
+test("procTableExecOptions: spawns hidden (GUI hosts flash a console otherwise)", () => {
+    const opts = procTableExecOptions();
+    assert.equal(opts.windowsHide, true, "an unhidden console child makes Windows allocate a console window");
+    assert.equal(opts.encoding, "utf8");
+    assert.equal(opts.timeout, 5000);
+});
 
 // ps prints "<ppid> <joined args>"; whitespace-splitting can only LOSE a
 // match (paths with spaces), never invent one.

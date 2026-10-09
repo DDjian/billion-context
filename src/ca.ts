@@ -133,6 +133,16 @@ foreach ($loc in 'LocalMachine','CurrentUser') {
 $out | ForEach-Object { '{"d":"' + $_ + '"}' }`;
 }
 
+/** #2439: exec options for the win32 store export. A host that owns no console
+ *  (dsh desktop / Electron) makes Windows allocate a NEW console window for any
+ *  unhidden console child — that is the black box users saw flash once per
+ *  bundle rebuild. #997/#999 swept the other call sites; this one arrived with
+ *  #1807. windowsHide is a documented no-op off Windows. Exported pure so tests
+ *  can pin it without opening a window. */
+export function osStoreExecOptions(): { timeout: number; maxBuffer: number; windowsHide: boolean } {
+    return { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
+}
+
 function splitPemBlocks(text: string): string[] {
     const out: string[] = [];
     const re = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\s*/g;
@@ -153,7 +163,7 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
     try {
         if (platform === "win32") {
             const buf = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", osStorePowerShellScript()],
-                { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+                osStoreExecOptions());
             return parseOsStoreNdjson(decodeOsStoreOutput(buf));
         }
         if (platform === "darwin") {

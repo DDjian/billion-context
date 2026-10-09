@@ -35,6 +35,16 @@ export const PACKAGE_NAME = readPkgField("name", "billion-context");
 //   2. dev (src/version.ts under tsx): ask git directly — identifies the
 //      CHECKOUT, which is what a dev session wants;
 //   3. "unknown" when neither exists.
+/** #2441: exec options for the git build-commit fallback below (dev checkouts
+ *  / dist without build-info.json). A host that owns no console (dsh desktop /
+ *  Electron) makes Windows allocate a NEW console window for any unhidden
+ *  console child — same failure domain as #2439/#2440. windowsHide is a
+ *  documented no-op off Windows. Exported pure so tests can pin it without
+ *  touching git. */
+export function gitFallbackExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean } {
+    return { encoding: "utf8", timeout: 10_000, windowsHide: true };
+}
+
 let cachedCommit: string | undefined;
 function resolveBuildCommit(): string {
     if (cachedCommit !== undefined) return cachedCommit;
@@ -55,7 +65,7 @@ function resolveBuildCommit(): string {
     try {
         const root = path.dirname(path.dirname(here));
         const run = (args: string[]): string =>
-            execFileSync("git", args, { cwd: root, encoding: "utf8", timeout: 10_000 }).trim();
+            execFileSync("git", args, { ...gitFallbackExecOptions(), cwd: root }).trim();
         const commit = run(["rev-parse", "--short", "HEAD"]);
         if (/^[0-9a-f]{7,12}$/.test(commit)) {
             try {

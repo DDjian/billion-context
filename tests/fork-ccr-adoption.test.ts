@@ -254,9 +254,9 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     assert.ok(ack.includes(BIG_B.slice(0, 200)), "adopted original rides in the tool result (v2)");
 
     // The child's own next request + fold must not clobber the adopted entry
-    // (append-only, first write wins) — even though the child's own m00007 is
-    // a different branch message (ref numbers are session-scoped; the
-    // placeholder's promise is what retrieval honors).
+    // (append-only, first write wins). The child's own branch messages are
+    // numbered above the parent's highest ref, so the placeholder's #m00007
+    // keeps denoting the parent's message rather than a new branch message.
     storeEffectiveCcr(child, { enabled: true, minToolTokens: 50 });
     const t2 = armed.core.processTurn({
         messages: openaiToCore(forkBody).msgs,
@@ -269,8 +269,10 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     child.state = t2.state;
     adoptContentStore(child, t2.contentStore);
     assert.equal(t2.contentStore.byRef["m00007"].hash, cstore.byRef["m00007"].hash);
+    const childRef = (i: number) => child.state.messageRefs.byRaw[t2.messages[i].id];
+    assert.equal(childRef(3), "m00012", "branch numbering starts above the parent's m00010");
     applyRanges(
-        parseCompressInput({ content: [{ startId: "m00006", endId: "m00009", summary: "Branch phase folded.", topic: "Branch" }] }),
+        parseCompressInput({ content: [{ startId: childRef(3), endId: childRef(6), summary: "Branch phase folded.", topic: "Branch" }] }),
         { core: armed.core, config: armed.config, messages: t2.messages, session: child, log: () => {} },
     );
     assert.ok([...child.state.blocks].some((b) => b.active && b.blockId !== armed.blockId), "child's own fold created a second block");

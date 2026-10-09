@@ -1,0 +1,403 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { once } from "node:events";
+import { createHash } from "node:crypto";
+import test from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { defaultConfig, type CoreMessage } from "acp-kernel";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { _resetSessionsForTest } from "../src/session.ts";
+import { _setForTest } from "../src/registry.ts";
+import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { incomingCoreMessages } from "../src/fork-adoption.ts";
+import { anthropicBodyToCore, chatBodyToCore, createForkAdopter, forkIdentityHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption, type ForkAdoptInput } from "../src/agent/fork-adopt.ts";
+import { createBiliPlugin } from "../src/agent/pi.ts";
+
+process.env.NODE_ENV = "test";
+const testRoot = mkdtempSync(join(tmpdir(), "bili-piomp-fork-"));
+test.after(() => rmSync(testRoot, { recursive: true, force: true }));
+for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
+const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
+
+const anthropicBody = {
+    model: "claude-test",
+    system: "system prompt",
+    max_tokens: 1024,
+    messages: [
+        { role: "user", content: [{ type: "text", text: "first original " }] },
+        { role: "assistant", content: [{ type: "text", text: "second original " }, { type: "tool_use", id: "tu-1", name: "run", input: { a: 1 } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-1", content: "tool output" }] },
+        { role: "user", content: [{ type: "text", text: "tail original" }] },
+    ],
+};
+
+test("anthropicBodyToCore projects identically to the server's incomingCoreMessages anthropic branch (#2399 parity)", () => {
+    const client = anthropicBodyToCore(anthropicBody);
+    const server = incomingCoreMessages("anthropic", anthropicBody);
+    assert.notEqual(client, null);
+    assert.notEqual(server, null);
+    assert.equal(client!.length, server!.length);
+    for (let i = 0; i < client!.length; i += 1) {
+        assert.equal(forkIdentityHashOf(client![i]!), forkIdentityHashOf(server![i]!), `message ${i} identity diverged`);
+    }
+    assert.equal(client![0]!.role, "user");
+    assert.equal(client!.some((m) => m.role === "system"), false, "leading system stays hoisted out of the fold space");
+});
+
+test("chatBodyToCore discriminates the chat dialects and skips responses/google (#2399)", () => {
+    assert.notEqual(chatBodyToCore({ messages: [{ role: "user", content: "hi" }] }), null, "openai projects");
+    assert.notEqual(chatBodyToCore(anthropicBody), null, "anthropic projects");
+    assert.deepEqual(chatBodyToCore({ model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }), null, "responses skipped");
+    assert.deepEqual(chatBodyToCore({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }), null, "google skipped");
+    const openai = { messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }] };
+    assert.equal(chatBodyToCore(openai)!.length, openaiBodyToCore(openai)!.length, "openai keeps the stage-1 projection");
+});
+
+// ---------------------------------------------------------------------------
+// createForkAdopter coordinator: gate/skip matrix, once-per-child, single
+// flight — with a recording fake fetch.
+// ---------------------------------------------------------------------------
+
+type Recorded = { method: string; url: string; body?: unknown };
+function fakeFetchRouting(routes: Array<{ match: (call: Recorded) => boolean; respond: () => Response | Promise<Response> }>): { fetchImpl: typeof fetch; calls: Recorded[] } {
+    const calls: Recorded[] = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        const call: Recorded = { method: init?.method ?? "GET", url };
+        if (typeof init?.body === "string") call.body = JSON.parse(init.body);
+        calls.push(call);
+        for (const route of routes) {
+            if (route.match(call)) return await route.respond();
+        }
+        return new Response("{}", { status: 404 });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, calls };
+}
+
+const manifestRoute = { match: (c: Recorded) => c.url.endsWith("/__bili/plugin/manifest"), respond: () => Response.json({ capabilities: { fork: { protocolVersion: 1 } } }) };
+const snapshotRoute = { match: (c: Recorded) => c.url.includes("/__bili/plugin/snapshot"), respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: "x1" }] }) };
+const forkRoute = { match: (c: Recorded) => c.url.endsWith("/__bili/plugin/fork"), respond: () => new Response(JSON.stringify({ ok: true }), { status: 201 }) };
+
+const adoptInput = (over: Partial<ForkAdoptInput> = {}): ForkAdoptInput => ({ base: "http://px", parent: "p1", child: "c1", body: { messages: [{ role: "user", content: "hi" }] }, ...over });
+
+test("createForkAdopter skips without consuming anything on ineligible input", async () => {
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, snapshotRoute, forkRoute]);
+    const adopter = createForkAdopter(() => undefined, { fetchImpl });
+    await adopter.maybeAdopt(undefined);
+    await adopter.maybeAdopt(adoptInput({ parent: "c1" }));
+    await adopter.maybeAdopt(adoptInput({ parent: "" }));
+    await adopter.maybeAdopt(adoptInput({ child: "" }));
+    await adopter.maybeAdopt(adoptInput({ base: "" }));
+    // A body-less request (opencode V2 ws handshake's synthetic Request) must
+    // not burn an attempt slot: repeated handshakes would otherwise close the
+    // window before the first real model request (#2403 review).
+    for (let i = 0; i < 5; i += 1) await adopter.maybeAdopt(adoptInput({ body: undefined }));
+    assert.equal(calls.length, 0);
+    const after = adoptInput();
+    await adopter.maybeAdopt(after);
+    assert.ok(calls.some((c) => c.url.includes("snapshot")), "the window is still open for the first real body");
+});
+
+test("createForkAdopter marks done on manifest-incapable proxies and never refetches", async () => {
+    resetForkCapabilityCacheForTest();
+    const { fetchImpl, calls } = fakeFetchRouting([{ match: manifestRoute.match, respond: () => Response.json({ capabilities: {} }) }]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.includes("manifest")).length, 1, "manifest probed once");
+    assert.equal(calls.filter((c) => c.url.includes("snapshot") || c.url.includes("fork")).length, 0);
+    assert.ok(lines.some((l) => l.includes("does not advertise the fork capability")));
+});
+
+test("createForkAdopter degrades once on prefix mismatch and stays done", async () => {
+    resetForkCapabilityCacheForTest();
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, snapshotRoute, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    // The snapshot identity hash "x1" matches nothing in the openai projection
+    // of this body (ids differ), so branchPoint === 0 → degrade, no fork POST.
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.includes("snapshot")).length, 1);
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0);
+    assert.ok(lines.some((l) => l.includes("degraded (no prefix match)")));
+});
+
+test("createForkAdopter never throws — an exploding network soft-degrades and closes the window", async () => {
+    resetForkCapabilityCacheForTest();
+    const boom = (async () => { throw new Error("network exploded"); }) as unknown as typeof fetch;
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl: boom });
+    // manifestForkCapable swallows the explosion (false = not capable), so the
+    // child degrades on the capability line and maybeAdopt never rejects.
+    await adopter.maybeAdopt(adoptInput());
+    assert.ok(lines.some((l) => l.includes("does not advertise the fork capability")), "the failure is logged, not thrown");
+    const callsBefore = lines.length;
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(lines.length, callsBefore, "the child is done after the first terminal outcome");
+});
+
+test("createForkAdopter retries transient failures until the cap, then closes (#2403 review)", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
+    const matchSnapshot = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    const { fetchImpl, calls } = fakeFetchRouting([
+        manifestRoute,
+        matchSnapshot,
+        { match: (c) => c.url.endsWith("/__bili/plugin/fork"), respond: () => new Response("upstream melted", { status: 503 }) },
+    ]);
+    const adopter = createForkAdopter(() => undefined, { fetchImpl });
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 3, "each attempt within the cap re-posts");
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 3, "past the cap the window is closed");
+});
+
+test("createForkAdopter skips side-shaped bodies without consuming the attempt budget (#2399 gate ④)", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
+    const matchSnapshot = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, matchSnapshot, forkRoute]);
+    const adopter = createForkAdopter(() => undefined, { fetchImpl });
+    const side = adoptInput({ body: { messages: [{ role: "user", content: "title please" }], max_tokens: 64 } });
+    await adopter.maybeAdopt(side);
+    await adopter.maybeAdopt(side);
+    assert.equal(calls.length, 0, "a title sidecar neither fetches nor burns attempts");
+    const main = adoptInput();
+    await adopter.maybeAdopt(main);
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 1, "the next real main request adopts normally");
+});
+
+test("createForkAdopter single-flights concurrent adoptions for the same child", async () => {
+    resetForkCapabilityCacheForTest();
+    let releaseSnapshot: (() => void) | undefined;
+    const { fetchImpl, calls } = fakeFetchRouting([
+        manifestRoute,
+        { match: (c) => c.url.includes("/__bili/plugin/snapshot"), respond: () => new Promise<Response>((resolve) => { releaseSnapshot = () => resolve(Response.json({ parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [] })); }) },
+        forkRoute,
+    ]);
+    const adopter = createForkAdopter(() => undefined, { fetchImpl });
+    const first = adopter.maybeAdopt(adoptInput());
+    const second = adopter.maybeAdopt(adoptInput());
+    await new Promise((r) => setTimeout(r, 10));
+    releaseSnapshot?.();
+    await Promise.all([first, second]);
+    assert.equal(calls.filter((c) => c.url.includes("snapshot")).length, 1, "the second caller rides the inflight adoption");
+});
+
+// ---------------------------------------------------------------------------
+// Real-proxy harness (mirrors tests/dsh-fork-adopt.test.ts): a stamped
+// OpenAI-wire parent, then extension-driven adoption from the pi/omp plugin
+// wiring, then the child replay must be accepted.
+// ---------------------------------------------------------------------------
+
+async function harness() {
+    const dir = mkdtempSync(join(testRoot, "run-"));
+    for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    resetToolRingForTest();
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: false, debounceMs: 60000 });
+    _setStoreForTest(store);
+    _setForTest({});
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const addr = upstream.address();
+    assert(addr && typeof addr === "object");
+    const upstreamUrl = `http://127.0.0.1:${addr.port}`;
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    await once(proxy, "listening");
+    const paddr = proxy.address();
+    assert(paddr && typeof paddr === "object");
+    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+}
+
+async function seedParent(h: Awaited<ReturnType<typeof harness>>, conversationId: string) {
+    const seed = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conversationId },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+        ] }),
+    });
+    assert.equal(seed.status, 200, await seed.text());
+}
+
+type RecordedTool = { name: string; parameters: unknown; execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: Record<string, unknown>) => Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> };
+type FakePi = { events: Map<string, (event: unknown, ctx: unknown) => unknown>; tools: RecordedTool[]; on: (event: string, handler: (event: never, ctx: never) => unknown) => void; registerTool: (tool: RecordedTool) => void };
+
+function makeFakePi(): FakePi {
+    const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const tools: RecordedTool[] = [];
+    return {
+        events,
+        tools,
+        on: (event, handler) => {
+            const h = handler as (event: unknown, ctx: unknown) => unknown;
+            const prev = events.get(event);
+            events.set(event, prev ? ((e, c) => { prev(e, c); return h(e, c); }) : h);
+        },
+        registerTool: (tool) => {
+            const i = tools.findIndex((t) => t.name === tool.name);
+            if (i >= 0) tools[i] = tool;
+            else tools.push(tool);
+        },
+    };
+}
+
+function pluginCtx(h: Awaited<ReturnType<typeof harness>>, sid: string, parentSession: string): Record<string, unknown> {
+    return {
+        sessionManager: { getSessionId: () => sid, getHeader: () => ({ parentSession }) },
+        model: { id: "claude-test", contextWindow: 1000000, baseUrl: `${h.origin}/bili/${h.upstreamUrl}/v1` },
+        cwd: "/tmp",
+    };
+}
+
+test("full chain: omp lane adopts behind its own identity register (#2399 stage 2 / B-plan)", async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "parent-sid");
+        const pi = makeFakePi();
+        createBiliPlugin("omp")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler, "before_provider_request handler registered");
+        const ctx = pluginCtx(h, "child-sid", "parent-sid");
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+            { role: "user", content: "new fork tail" },
+        ] };
+        // registerTools (identity register for omp, WITH the parent) runs inside
+        // this awaited handler BEFORE the adoption — so a successful snapshot
+        // below proves the server-side same-parent exception let the fork
+        // through the registeredIds claim.
+        await handler({ payload: body }, ctx);
+        assert.ok(pi.tools.length > 0, "tools registered against the real manifest");
+        const childSnapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=child-sid`);
+        const childSnapshotText = await childSnapshot.text();
+        assert.equal(childSnapshot.status, 200, childSnapshotText);
+        const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
+        assert.equal(childBody.orderedMessages.length, 3, "child inherited the parent prefix");
+
+        const replay = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": "child-sid" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(replay.status, 200, await replay.text());
+    } finally {
+        await h.close();
+    }
+});
+
+test("full chain: pi lane resolves a path-shaped parentSession header and adopts (#2399 stage 2)", async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "pi-parent");
+        const parentFile = join(h.dir, "parent-session.jsonl");
+        writeFileSync(parentFile, JSON.stringify({ type: "session", id: "pi-parent" }) + "\n");
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler, "before_provider_request handler registered");
+        const ctx = pluginCtx(h, "child-sid", parentFile);
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+            { role: "user", content: "new fork tail" },
+        ] };
+        await handler({ payload: body }, ctx);
+        const childSnapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=child-sid`);
+        const childSnapshotText = await childSnapshot.text();
+        assert.equal(childSnapshot.status, 200, childSnapshotText);
+        const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
+        assert.equal(childBody.orderedMessages.length, 3, "child inherited the parent prefix via the path-resolved id");
+    } finally {
+        await h.close();
+    }
+});
+
+test("full chain: pi lane skips adoption when no parent is declared", async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler);
+        const ctx = pluginCtx(h, "plain-sid", "");
+        await handler({ payload: { model: "claude-test", messages: [{ role: "user", content: "hi" }] } }, ctx);
+        const snapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=plain-sid`);
+        assert.equal(snapshot.status, 404, "no fork was posted for a root session");
+    } finally {
+        await h.close();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Server-side B-plan semantics: the registeredIds claim a host makes at
+// session_start must yield only for the SAME parent declaration.
+// ---------------------------------------------------------------------------
+
+test("fork endpoint: identity-registered child yields only for the same parent (#2399 B-plan)", async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "parent-sid");
+        const register = (conversationId: string, parentConversationId?: string) => fetch(`${h.origin}/__bili/plugin/register`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId, agent: "omp", identity: true, ...(parentConversationId !== undefined ? { parentConversationId } : {}) }),
+        });
+        assert.equal((await register("child-same", "parent-sid")).status, 200);
+        const adopted = await tryForkAdoption({ base: h.origin, parentConversationId: "parent-sid", childConversationId: "child-same", body: { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+            { role: "user", content: "new tail" },
+        ] } });
+        assert.deepEqual(adopted, { outcome: "adopted", branchPoint: 3, replayed: false }, "same-parent register claim yields to the fork");
+
+        assert.equal((await register("child-diff", "some-other-parent")).status, 200);
+        const conflicted = await tryForkAdoption({ base: h.origin, parentConversationId: "parent-sid", childConversationId: "child-diff", body: { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+        ] } });
+        assert.deepEqual(conflicted, { outcome: "degraded", reason: "fork http 409 CHILD_CONFLICT" }, "different-parent claim stays a conflict");
+
+        assert.equal((await register("child-bare")).status, 200);
+        const bare = await tryForkAdoption({ base: h.origin, parentConversationId: "parent-sid", childConversationId: "child-bare", body: { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+        ] } });
+        assert.deepEqual(bare, { outcome: "degraded", reason: "fork http 409 CHILD_CONFLICT" }, "parentless claim stays a conflict");
+    } finally {
+        await h.close();
+    }
+});

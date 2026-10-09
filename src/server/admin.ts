@@ -9,6 +9,7 @@ import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } fr
 import { applyCompressSettings } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
+import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
@@ -175,10 +176,14 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
-    if (req.method === "GET" && req.url === "/__bili/") {
+    // #2321: the bare path also tolerates a query (?embed=1&lang=…) — the dsh
+    // settings panel frames exactly this route. Every /__bili/ URL already
+    // passed the loopback/trusted-origin/tunnel gates above, so nothing opens.
+    if (req.method === "GET" && req.url !== undefined && (req.url === "/__bili/" || req.url.startsWith("/__bili/?"))) {
+        const u = new URL(req.url, "http://localhost");
         const origin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}`;
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(renderUI(origin));
+        res.end(renderUI(origin, { embed: u.searchParams.get("embed") === "1" }));
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
@@ -556,7 +561,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -606,6 +611,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         stale,
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
+        pluginAdvisories: detectCostAdvisories(process.env),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),

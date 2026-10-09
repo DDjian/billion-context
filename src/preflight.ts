@@ -1,4 +1,5 @@
 import {
+    countMessageTokens,
     defaultCountTokens,
     viableRanges,
     type CompressionCore,
@@ -87,6 +88,30 @@ const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
 // skip a doomed round only when the shortfall survives this slack — when
 // unsure, walk exactly as before.
 const FUTILITY_SLACK = 1.2;
+// #2383: entry overshoot (entryTokens / window) above which the LLM fold path
+// is PROVABLY unable to converge in this invocation — it exceeds the raised
+// budget's maximum coverage (MAX_PREFLIGHT_ROUNDS * 2 rounds x CHUNK_FRACTION
+// x window per ideal fold). Observed shape: a dsh fork resends its whole raw
+// history as a fresh session (5.09M tokens vs a 240K window = 21.2x): ~45
+// folds are needed against a 32-round cap, each fold costs one upstream call
+// (~15-30s), and the host client disconnects every ~300s — the user retries
+// forever and the session never starts. In that regime the fold only needs to
+// be a VALID block summary (the folded originals stay restorable via
+// decompress — applyRanges caches them like any other preflight fold), so the
+// summarization call is replaced by a CPU-only structural digest
+// (deterministicDigest below). Hard constant by design: no new config surface,
+// and the trigger derives from this loop's own coverage math instead of an
+// arbitrary multiplier — normal sessions (one turn of growth per request)
+// never approach it.
+const EMERGENCY_FOLD_COVERAGE = MAX_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
+// Round cap for the emergency regime: every round is CPU-only (kernel walk +
+// digest, no upstream wait), so even the worst case stays at seconds; 512
+// covers ~250x the window at observed per-fold savings (~0.5-0.6x window) —
+// far beyond any realistic resend size.
+const EMERGENCY_ROUND_CAP = 512;
+// Per-entry head-fragment length in digest form A (form B strips heads when
+// even that does not fit the bounds).
+const DIGEST_HEAD_CHARS = 120;
 
 // #869 review: coverage bound of the two depth budgets above. One round folds
 // ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
@@ -101,6 +126,9 @@ const FUTILITY_SLACK = 1.2;
 // dynamic: base 16 covers payloads up to ~1.4x the window (one ideal fold
 // removes CHUNK_FRACTION x window); larger entry overshoots scale both
 // budgets proportionally, capped at 2x the base (see preflightCompress).
+// #2383 extends coverage past the bound: an entry overshoot above
+// EMERGENCY_FOLD_COVERAGE switches every fold to a deterministic digest
+// (zero upstream calls), so structurally unconvergent payloads converge too.
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
@@ -247,9 +275,16 @@ function refNum(ref: string): number {
 // CJK-aware: the fast chars/4 estimator undercounts CJK ~4× (CJK is ~1
 // token/char), which made the fit check believe an oversized CJK payload
 // already fit and skip compression. defaultCountTokens counts CJK per-char.
+// #2407: host-projected thinking mass (CoreMessage.thinkingTokens, #1320) is
+// billed by upstream but invisible in m.text — count it via the kernel's
+// countMessageTokens so every consumer of this estimator (the k̂ calibration
+// denominator at the prepare sites, preflight fit/round budgets, the output
+// clamp, the image-cost textSide) carries billed-caliber mass. Without it the
+// k̂ sample divides a bill that includes thinking by an estimate that
+// excludes it, and thinking-heavy routes learn an inflated factor.
 export function estimateCoreMessages(messages: CoreMessage[]): number {
     let tokens = 0;
-    for (const m of messages) tokens += defaultCountTokens(m.text ?? "");
+    for (const m of messages) tokens += countMessageTokens(m, defaultCountTokens);
     return tokens;
 }
 
@@ -1065,6 +1100,55 @@ function noEmergencyTruncate(config: Config): Config {
     return { ...config, modelContextLimit: config.modelContextLimit * 100 };
 }
 
+// #2383: CPU-only stand-in for the LLM summary in the emergency-fold regime.
+// A fold only needs a summary the kernel accepts that nets a shrink; the
+// folded originals stay restorable because applyRanges caches them (CCR store)
+// exactly like any other preflight fold. The digest is structural — per-entry
+// ref/label/size plus a head fragment — so a reader can see what was folded
+// and where it lives. Three fallback forms guarantee the result fits BOTH
+// maxSummaryLength and the net-shrink bound by construction; the output is
+// deterministic (no timestamps), so repeated folds of identical content are
+// byte-stable for prefix caching.
+interface DigestEntry {
+    ref: string;
+    label: string;
+    text: string;
+}
+
+interface DeterministicDigestOptions {
+    /** compress.maxSummaryLength chars; <= 0 means unbounded. */
+    maxSummary?: number;
+    /** compress.minSummaryLength chars — the floor the kernel requires. */
+    minSummaryLength: number;
+    /** countText-unit ceiling (spanUnits / NET_SHRINK_TOLERANCE). */
+    shrinkBound: number;
+    countText: (text: string) => number;
+}
+
+export function deterministicDigest(entries: DigestEntry[], startRef: string, endRef: string, opts: DeterministicDigestOptions): string {
+    const { maxSummary, minSummaryLength, shrinkBound, countText } = opts;
+    const totalChars = entries.reduce((sum, entry) => sum + entry.text.length, 0);
+    const header = `[deterministic digest ${startRef}:${endRef}] ${entries.length} message(s), ~${totalChars} char(s) total. Emergency fast-path under extreme overflow (#2383): structural digest, no LLM summary; originals preserved - decompress this block to restore them verbatim.`;
+    const fits = (form: string): boolean =>
+        countText(form) <= shrinkBound && (maxSummary === undefined || maxSummary <= 0 || form.length <= maxSummary);
+    const line = (entry: DigestEntry, headChars: number): string => {
+        const head = headChars > 0 ? ` :: ${entry.text.replace(/\s+/g, " ").trim().slice(0, headChars)}` : "";
+        return `[${entry.ref} ${entry.label}] ${entry.text.length}ch${head}`;
+    };
+    for (const headChars of [DIGEST_HEAD_CHARS, 0]) {
+        const body = entries.map((entry) => line(entry, headChars)).join("\n");
+        const form = entries.length > 0 ? `${header}\n${body}` : header;
+        if (fits(form)) return form;
+    }
+    if (fits(header)) return header;
+    // Pathological: even the header cannot fit the bounds — emit a minimal
+    // marker padded to the kernel's minimum so the block still applies.
+    const marker = `[deterministic digest ${startRef}:${endRef}]`;
+    if (marker.length >= minSummaryLength) return marker;
+    const pad = Math.max(0, minSummaryLength - marker.length - 1);
+    return `${marker} ${"x".repeat(pad)}`;
+}
+
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
     // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
@@ -1155,7 +1239,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (summaryBudget > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
         deps.log("warn", `[preflight] payload ~${entryTokens} tok vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
     }
-    for (let round = 0; round < roundBudget; round++) {
+    // #2383: the fold MECHANISM is decided once per invocation from the entry
+    // overshoot (same discipline as baselineKnown — no mid-loop regime flips).
+    // Beyond EMERGENCY_FOLD_COVERAGE the LLM path cannot converge here, so
+    // every fold becomes a deterministic digest: zero upstream calls, no
+    // failure modes, originals restorable via decompress.
+    // The regime judges the FOLDABLE mass (entryLocal), never the
+    // baseline-floored entryTokens: a usage baseline measured on another model
+    // (model switch) or a stale high-water mark covers system prompt + tool
+    // definitions that NO fold can remove — letting it pick the regime would
+    // digest-fold ordinary payloads (caught by the model-switch e2e: its
+    // summarization calls vanished under a 300k foreign-model baseline).
+    const entryOvershoot = limit > 0 && entryLocal > 0 ? entryLocal / limit : 1;
+    const emergencyFold = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
+    const effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
+    if (emergencyFold) {
+        deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
+    }
+    for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
             break;
@@ -1444,6 +1545,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const byRaw = deps.session.state?.messageRefs?.byRaw;
                 const parts: string[] = [];
                 const droppedParts: string[] = [];
+                // #2383: parallel to `parts` — the digest's input, collected only
+                // in the emergency regime so the LLM path stays byte-identical.
+                const entries: DigestEntry[] = [];
                 for (const id of planned.directMessageIds) {
                     const i = idxById.get(id);
                     if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
@@ -1464,6 +1568,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 ? "assistant reasoning"
                                 : m.role;
                     parts.push(`[${label}]\n${text}`);
+                    if (emergencyFold) entries.push({ ref: maps.idxToRef.get(i) ?? "?", label, text });
                 }
                 for (const nid of planned.directBlockIds) {
                     const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
@@ -1472,6 +1577,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
                     const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
                     parts.push(`[summarized ${label}]\n${nb.summary}`);
+                    if (emergencyFold) entries.push({ ref: nb.blockId, label: `summarized ${label}`, text: nb.summary });
                 }
                 if (droppedParts.length > 0) {
                     deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
@@ -1484,143 +1590,161 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 }
                 let summary: string | null = null;
                 let outcome: SummaryOutcome | undefined;
-                try {
-                    const parts: string[] = [];
-                    const chunks = splitSummaryContent(content, budget, countText);
-                    // #1775: spread maxSummaryLength across the chunks (minus the exact
-                    // "\n\n" join gaps) so each summarization call carries a per-chunk
-                    // character ceiling — previously nothing bounded the model's output,
-                    // and one verbose chunk made the whole assembly unusable.
-                    const maxSummary = activeConfig.compress.maxSummaryLength;
-                    const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
-                    for (const chunk of chunks) {
-                        if (summaryCalls >= summaryBudget) {
-                            budgetHit = true;
-                            break;
-                        }
-                        summaryCalls += 1;
-                        let part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
-                        let transientTries = 0;
-                        while (
-                            "unusable" in part && part.transient &&
-                            transientTries < TRANSIENT_EMPTY_SUMMARY_RETRIES &&
-                            transientRetryBudget > 0 &&
-                            summaryCalls < summaryBudget &&
-                            !deps.signal?.aborted
-                        ) {
-                            transientTries += 1;
-                            transientRetryBudget -= 1;
-                            const delayMs = replayBackoffMs(transientTries);
-                            deps.log("warn", `[preflight] transient empty summary on ${startRef}:${endRef} (${part.unusable.slice(0, 160)}); retrying same span in ${delayMs}ms (${transientTries}/${TRANSIENT_EMPTY_SUMMARY_RETRIES})`);
-                            await sleep(delayMs, deps.signal);
+                // #2383: hoisted out of the LLM path below — the emergency digest
+                // branch needs the span's mass for its net-shrink bound before any
+                // summary exists; units match the post-fold accounting.
+                const spanUnits = baselineKnown
+                    ? planned.compressedTokens
+                    : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                if (emergencyFold) {
+                    // Zero-upstream-call fold. The digest fits maxSummaryLength AND
+                    // the net-shrink bound by construction (fallback forms), so it
+                    // never reaches the halving/skip recovery below — those stay the
+                    // LLM regime's.
+                    const shrinkBound = Math.max(activeConfig.compress.minSummaryLength, Math.floor(spanUnits / NET_SHRINK_TOLERANCE));
+                    summary = deterministicDigest(entries, startRef, endRef, {
+                        maxSummary: activeConfig.compress.maxSummaryLength,
+                        minSummaryLength: activeConfig.compress.minSummaryLength,
+                        shrinkBound,
+                        countText,
+                    });
+                    deps.log("info", `[preflight] range ${skipKey}: deterministic digest fold of ${entries.length} part(s) -> ${summary.length} chars, no summarization call (#2383)`);
+                } else {
+                    try {
+                        const parts: string[] = [];
+                        const chunks = splitSummaryContent(content, budget, countText);
+                        // #1775: spread maxSummaryLength across the chunks (minus the exact
+                        // "\n\n" join gaps) so each summarization call carries a per-chunk
+                        // character ceiling — previously nothing bounded the model's output,
+                        // and one verbose chunk made the whole assembly unusable.
+                        const maxSummary = activeConfig.compress.maxSummaryLength;
+                        const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
+                        for (const chunk of chunks) {
+                            if (summaryCalls >= summaryBudget) {
+                                budgetHit = true;
+                                break;
+                            }
                             summaryCalls += 1;
-                            part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
-                        }
-                        if ("unusable" in part) {
-                            outcome = part;
-                            break;
-                        }
-                        parts.push(part.summary);
-                    }
-                    if (!budgetHit && !outcome && parts.length === chunks.length) {
-                        const candidate = parts.join("\n\n");
-                        // #861: a summary the kernel would reject on length wastes the apply
-                        // attempt and its failure log — route it through the same
-                        // halving/skip path as any unusable output. #1775: except when
-                        // truncating to the cap still nets savings (the candidate is
-                        // shorter than the folded content) — then rescue the summary
-                        // instead of discarding the whole range. #1819: every accepted
-                        // candidate — rescued or not — must additionally satisfy net-shrink
-                        // monotonicity (NET_SHRINK_TOLERANCE) — same units as the post-fold
-                        // accounting below: token regime takes the kernel's credit for this
-                        // span, char regime the raw-char mass of the folded messages. A
-                        // regurgitated summary that exceeds its range routes through the
-                        // halving/skip path like any other unusable output instead of
-                        // inflating the payload.
-                        const spanUnits = baselineKnown
-                            ? planned.compressedTokens
-                            : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
-                        const shrinkOk = (text: string): boolean => countText(text) <= spanUnits * NET_SHRINK_TOLERANCE;
-                        if (maxSummary <= 0 || candidate.length <= maxSummary) {
-                            if (shrinkOk(candidate)) {
-                                summary = candidate;
-                            } else {
-                                outcome = { unusable: `assembled summary (~${countText(candidate)} units) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                            let part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
+                            let transientTries = 0;
+                            while (
+                                "unusable" in part && part.transient &&
+                                transientTries < TRANSIENT_EMPTY_SUMMARY_RETRIES &&
+                                transientRetryBudget > 0 &&
+                                summaryCalls < summaryBudget &&
+                                !deps.signal?.aborted
+                            ) {
+                                transientTries += 1;
+                                transientRetryBudget -= 1;
+                                const delayMs = replayBackoffMs(transientTries);
+                                deps.log("warn", `[preflight] transient empty summary on ${startRef}:${endRef} (${part.unusable.slice(0, 160)}); retrying same span in ${delayMs}ms (${transientTries}/${TRANSIENT_EMPTY_SUMMARY_RETRIES})`);
+                                await sleep(delayMs, deps.signal);
+                                summaryCalls += 1;
+                                part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                             }
-                        } else if (candidate.length < content.length) {
-                            const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
-                            if (rescued !== null && shrinkOk(rescued)) {
-                                deps.log("warn", `[preflight] range ${skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
-                                summary = rescued;
-                            } else if (rescued !== null) {
-                                outcome = { unusable: `assembled summary (~${countText(rescued)} units after truncation) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
-                            } else {
-                                outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be truncated to a usable length` };
+                            if ("unusable" in part) {
+                                outcome = part;
+                                break;
                             }
+                            parts.push(part.summary);
+                        }
+                        if (!budgetHit && !outcome && parts.length === chunks.length) {
+                            const candidate = parts.join("\n\n");
+                            // #861: a summary the kernel would reject on length wastes the apply
+                            // attempt and its failure log — route it through the same
+                            // halving/skip path as any unusable output. #1775: except when
+                            // truncating to the cap still nets savings (the candidate is
+                            // shorter than the folded content) — then rescue the summary
+                            // instead of discarding the whole range. #1819: every accepted
+                            // candidate — rescued or not — must additionally satisfy net-shrink
+                            // monotonicity (NET_SHRINK_TOLERANCE) — same units as the post-fold
+                            // accounting below: token regime takes the kernel's credit for this
+                            // span, char regime the raw-char mass of the folded messages. A
+                            // regurgitated summary that exceeds its range routes through the
+                            // halving/skip path like any other unusable output instead of
+                            // inflating the payload.
+                            const shrinkOk = (text: string): boolean => countText(text) <= spanUnits * NET_SHRINK_TOLERANCE;
+                            if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                                if (shrinkOk(candidate)) {
+                                    summary = candidate;
+                                } else {
+                                    outcome = { unusable: `assembled summary (~${countText(candidate)} units) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                                }
+                            } else if (candidate.length < content.length) {
+                                const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                                if (rescued !== null && shrinkOk(rescued)) {
+                                    deps.log("warn", `[preflight] range ${skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                    summary = rescued;
+                                } else if (rescued !== null) {
+                                    outcome = { unusable: `assembled summary (~${countText(rescued)} units after truncation) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                                } else {
+                                    outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be truncated to a usable length` };
+                                }
+                            } else {
+                                outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and is not shorter than the folded content (${content.length} chars)` };
+                            }
+                        }
+                    } catch (err) {
+                        if (err instanceof UpstreamHttpError) {
+                            // #1993: the rejection body is the only evidence for WHY the
+                            // upstream said no — log it the way the main paths already do
+                            // and carry a bounded snippet into the client-visible detail.
+                            const transient = isTransientUpstreamError(err.status, err.body);
+                            const shapeRejection = isCredentialShapeRejection(err.status, err.body);
+                            const bodySnippet = safePrefix(err.body.trim(), 200);
+                            failure = {
+                                kind: "upstream",
+                                status: err.status,
+                                // #2189: a shape-based rejection is deterministic for this
+                                // payload — a client retry hits the same wall, so do not
+                                // advertise retryability (and let the dead-end cooldown arm).
+                                retryable: shapeRejection ? false : transient,
+                                detail: err.status === 429
+                                    ? shapeRejection
+                                        ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (the upstream requires a request attribute missing from the summary call, e.g. the client's billing-attribution system block; #2189)`
+                                        : `the summarization call was rate-limited by the upstream (HTTP 429)`
+                                    : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
+                            };
+                            deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
+                            // #1993: a hard (non-transient) size-plausible rejection gets the
+                            // same halving recovery as an unusable HTTP-200 summary — the
+                            // whole request was refused, so it is at least as likely to be
+                            // size-driven as an empty 200. Transient 4xx (risk-control
+                            // markers) keep the replay-retry semantics; other 4xx (auth /
+                            // routing) fail fast instead of burning the call budget;
+                            // unsplittable spans fall through to the give-up below. The
+                            // cascade is bounded by the per-invocation summary budget
+                            // (summaryBudget, #1933) via the while-top budgetHit check.
+                            const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                            if ((err.status === 400 || err.status === 413) && !transient
+                                && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
+                                lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
+                                deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
+                                const mid = Math.floor((cs + ce) / 2);
+                                spans.push([mid + 1, ce]);
+                                spans.push([cs, mid]);
+                                continue;
+                            }
+                        } else if (deps.signal?.aborted) {
+                            failure = ABORTED_FAILURE;
+                            deps.log("warn", `[preflight] summarization aborted: client disconnected`);
+                        } else if (err instanceof SummaryTransportError) {
+                            // #1987: a transport-class death carries NO upstream verdict about the
+                            // content — the call simply did not complete — so it stays retryable for
+                            // the client regardless of which code surfaced (a cert problem is not more
+                            // terminal than a gzip corruption). Only an abort (client gone / idle budget)
+                            // is not worth retrying; keep that case's field omitted as before.
+                            const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
+                                ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
+                                : "";
+                            failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
+                            deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                         } else {
-                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and is not shorter than the folded content (${content.length} chars)` };
+                            failure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
+                            deps.log("warn", "[preflight] summarization failed unexpectedly");
                         }
+                        break;
                     }
-                } catch (err) {
-                    if (err instanceof UpstreamHttpError) {
-                        // #1993: the rejection body is the only evidence for WHY the
-                        // upstream said no — log it the way the main paths already do
-                        // and carry a bounded snippet into the client-visible detail.
-                        const transient = isTransientUpstreamError(err.status, err.body);
-                        const shapeRejection = isCredentialShapeRejection(err.status, err.body);
-                        const bodySnippet = safePrefix(err.body.trim(), 200);
-                        failure = {
-                            kind: "upstream",
-                            status: err.status,
-                            // #2189: a shape-based rejection is deterministic for this
-                            // payload — a client retry hits the same wall, so do not
-                            // advertise retryability (and let the dead-end cooldown arm).
-                            retryable: shapeRejection ? false : transient,
-                            detail: err.status === 429
-                                ? shapeRejection
-                                    ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (the upstream requires a request attribute missing from the summary call, e.g. the client's billing-attribution system block; #2189)`
-                                    : `the summarization call was rate-limited by the upstream (HTTP 429)`
-                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
-                        };
-                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
-                        // #1993: a hard (non-transient) size-plausible rejection gets the
-                        // same halving recovery as an unusable HTTP-200 summary — the
-                        // whole request was refused, so it is at least as likely to be
-                        // size-driven as an empty 200. Transient 4xx (risk-control
-                        // markers) keep the replay-retry semantics; other 4xx (auth /
-                        // routing) fail fast instead of burning the call budget;
-                        // unsplittable spans fall through to the give-up below. The
-                        // cascade is bounded by the per-invocation summary budget
-                        // (summaryBudget, #1933) via the while-top budgetHit check.
-                        const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
-                        if ((err.status === 400 || err.status === 413) && !transient
-                            && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
-                            lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
-                            deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
-                            const mid = Math.floor((cs + ce) / 2);
-                            spans.push([mid + 1, ce]);
-                            spans.push([cs, mid]);
-                            continue;
-                        }
-                    } else if (deps.signal?.aborted) {
-                        failure = ABORTED_FAILURE;
-                        deps.log("warn", `[preflight] summarization aborted: client disconnected`);
-                    } else if (err instanceof SummaryTransportError) {
-                        // #1987: a transport-class death carries NO upstream verdict about the
-                        // content — the call simply did not complete — so it stays retryable for
-                        // the client regardless of which code surfaced (a cert problem is not more
-                        // terminal than a gzip corruption). Only an abort (client gone / idle budget)
-                        // is not worth retrying; keep that case's field omitted as before.
-                        const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
-                            ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
-                            : "";
-                        failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
-                        deps.log("warn", `[preflight] summarization failed: ${err.message}`);
-                    } else {
-                        failure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
-                        deps.log("warn", "[preflight] summarization failed unexpectedly");
-                    }
-                    break;
                 }
                 if (summary === null) {
                     const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
@@ -1720,7 +1844,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 ? `no viable range could be compressed: ${cause}${unusableNote}`
                 : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
         } else {
-            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${roundBudget} rounds${unusableNote}${skipNote}` };
+            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${effectiveRoundCap} rounds${unusableNote}${skipNote}` };
         }
     }
     result.rangesRemaining = rangesRemaining;

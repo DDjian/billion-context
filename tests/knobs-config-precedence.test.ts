@@ -59,7 +59,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 10_000);
     assert.equal(knobs.persistEnabled(), true);
     assert.equal(knobs.persistZstdEnabled(), false);
-    assert.equal(knobs.publicSnapshotCapBytes(), 16_777_216);
+    assert.equal(knobs.publicSnapshotCapBytes(), 104_857_600);
     assert.equal(knobs.persistDebounceMs(), 500);
     assert.equal(knobs.persistTailTokens(), 16384);
     assert.equal(knobs.persistEpermAlertThreshold(), 5);
@@ -73,7 +73,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.updateRegistryBase(), undefined);
     assert.equal(knobs.updateCheckIntervalMs(), 180_000);
     assert.equal(knobs.ccrRetrievalTtlMs(), 10 * 60 * 1000);
-    assert.equal(knobs.publicSnapshotCapBytes(), 16_777_216);
+    assert.equal(knobs.publicSnapshotCapBytes(), 104_857_600);
     assert.equal(knobs.codexCompactMode(), "intercept");
     assert.equal(knobs.decompressTmpCap(), 50);
     assert.equal(knobs.bodyDumpEnabled(), false);
@@ -206,7 +206,7 @@ test("set env owns the knob: garbage env resolves exactly as pre-migration", () 
         assert.equal(knobs.replayBaseDelayMs(), REPLAY_BASE_DELAY_MS);
         assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
         assert.equal(knobs.persistDebounceMs(), 500);
-        assert.equal(knobs.publicSnapshotCapBytes(), 16_777_216);
+        assert.equal(knobs.publicSnapshotCapBytes(), 104_857_600);
     });
     // the plugin cap's pre-migration parser (Number(env)) treated "" as 0 —
     // "disables retention" — and that quirk survives byte-exact

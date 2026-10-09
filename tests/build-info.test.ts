@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
-import { VERSION, BUILD_COMMIT, versionWithCommit, PACKAGE_NAME } from "../src/version.js";
+import { VERSION, BUILD_COMMIT, versionWithCommit, PACKAGE_NAME, gitFallbackExecOptions } from "../src/version.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distEntry = path.join(root, "dist", "index.js");
@@ -25,6 +25,15 @@ test("BUILD_COMMIT resolves to a short hash (dev checkout) or explicit unknown",
 test("versionWithCommit renders the banner form", () => {
     assert.equal(versionWithCommit(), `${VERSION} (${BUILD_COMMIT})`);
     assert.match(versionWithCommit(), /^\d+\.\d+\.\d+ \(/);
+});
+
+// #2441: pin the git-fallback exec options so a future "simplification" cannot
+// drop windowsHide (a console-less GUI host would flash a console per spawn).
+test("gitFallbackExecOptions: spawns hidden (GUI hosts flash a console otherwise)", () => {
+    const opts = gitFallbackExecOptions();
+    assert.equal(opts.windowsHide, true, "an unhidden console child makes Windows allocate a console window");
+    assert.equal(opts.encoding, "utf8");
+    assert.equal(opts.timeout, 10_000);
 });
 
 test("--version prints semver plus commit and stays regex-friendly", { skip: !fs.existsSync(distEntry) && "dist not built yet (npm run build)" }, () => {

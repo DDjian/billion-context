@@ -1,4 +1,4 @@
-import { createInitialState, defaultConfig, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
@@ -197,10 +197,11 @@ export type Session = {
         lastInputTokensOrigin?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
-          *  text estimate), clamped to [0.25, 1] — one-way by design: the
-          *  correction can only deflate the estimate (never fire earlier
-          *  than the raw proxy); routes billing above the local estimate
-          *  publish k̂=1 (legacy behavior, overflow arm covers them). A
+         *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
+         *  correction can inflate OR deflate the estimate toward the route's
+         *  real billing scale (the one-way max-1 design failed empirically on
+         *  CJK-heavy routes where billing runs 2.4–4.0× above the local
+         *  estimate, so under-estimating routes learned nothing). A
           *  sample is only admitted
           *  when it falls in the plausibility band [0.2, 5] — outside it the
           *  report and the payload clearly don't correspond (placeholder
@@ -235,7 +236,8 @@ export type Session = {
          calibrationRing?: { origin: string; model?: string; values: number[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
-         *  system/tools overhead + image reserve, defaultCountTokens rate),
+         *  system/tools overhead + image reserve, defaultCountTokens rate;
+         *  includes host-projected thinking mass since #2407),
          *  recorded in prepare*. settleUsageReport pairs it with the NEXT
          *  usage report's billed total (same request) to sample k̂, then
          *  overwrites it with the current turn's value. In-memory only — a
@@ -1021,6 +1023,22 @@ export function preCompactionArchiveOf(session: Session): PreCompactionArchive {
 // byRaw/byRef are pruned to liveRawIds (stops the #390 additive leak).
 // nextIndex is left alone so a freed ref slot is never re-allocated onto a
 // retained tail's live tag.
+/** Synthetic byRaw key pinning a session's ref high-water mark. Its value is
+ *  the highest ref this session must never re-allocate (refs the parent used
+ *  before a fork/resume, or numbers freed by an archive prune); the kernel
+ *  cursor (highestUsedIndex+1) then starts above it. Never a real message id
+ *  (those are SHA-256 hex), so it matches no incoming message and has no
+ *  byRef entry. */
+export const REF_FLOOR_RAW_ID = "bili:ref-floor";
+
+/** Raise `session`'s ref floor to at least `index` (no-op when its map
+ *  already reaches that high). */
+export function reserveRefsThrough(session: Session, index: number): boolean {
+    if (index <= highestUsedIndex(session.state.messageRefs)) return false;
+    session.state.messageRefs.byRaw[REF_FLOOR_RAW_ID] = indexToRef(index);
+    return true;
+}
+
 export function applyCompactionArchive(
     session: Session,
     activeBefore: Set<string>,
@@ -1043,10 +1061,15 @@ export function applyCompactionArchive(
     }
 
     const { byRaw, byRef } = session.state.messageRefs;
+    const highestBefore = highestUsedIndex(session.state.messageRefs);
     const prunedByRaw: Record<string, string> = {};
     for (const [rawId, ref] of Object.entries(byRaw)) {
         if (liveRawIds.has(rawId)) prunedByRaw[rawId] = ref;
     }
+    // The kernel's ref cursor is highestUsedIndex+1, so pruning the top of
+    // the map would hand the freed numbers out again — pin the old high-water
+    // mark (refs are never reused within a session).
+    if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
     const prunedByRef: Record<string, string> = {};
     for (const [ref, rawId] of Object.entries(byRef)) {
         if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
@@ -1083,6 +1106,11 @@ const REWRITE_MAX_KNOWN_RATIO = 0.5;
 // prior history (clients keep a tail through compaction), so require both
 // before treating the shrink as real. Missing a genuine rewrite is cheap
 // (stale map entries linger until session end); a false positive is fatal.
+// The ratio is also required on the PRIOR side (known ids that survived /
+// known ids before): a turn that keeps all of the prior history but appends
+// a lot of new material (a resume that inherited only an old ancestor's refs,
+// a large batch of tool results) dilutes the incoming-side ratio without
+// rewriting anything — a rewrite is when most of the old history is gone.
 export const REWRITE_MIN_INCOMING_TOTAL = 10;
 
 interface RewriteDetection {
@@ -1097,7 +1125,7 @@ export function detectUnannouncedHistoryRewrite(
     knownRefsBefore: ReadonlySet<string>,
     liveRawIds: Iterable<string>,
 ): RewriteDetection {
-    const knownBefore = knownRefsBefore.size;
+    const knownBefore = knownRefsBefore.size - (knownRefsBefore.has(REF_FLOOR_RAW_ID) ? 1 : 0);
     let incomingTotal = 0;
     let knownIncoming = 0;
     for (const id of liveRawIds) {
@@ -1109,7 +1137,8 @@ export function detectUnannouncedHistoryRewrite(
         session.state.blocks.length > 0 &&
         incomingTotal >= REWRITE_MIN_INCOMING_TOTAL &&
         knownIncoming > 0 &&
-        knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO;
+        knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO &&
+        knownIncoming / knownBefore < REWRITE_MAX_KNOWN_RATIO;
     return { detected, knownBefore, incomingTotal, knownIncoming };
 }
 

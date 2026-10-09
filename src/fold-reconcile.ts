@@ -26,6 +26,17 @@
 // protocol-unique tool id or full normalized-text equality at the same
 // duplicate-ordinal inside the aligned churn region — never fuzzy similarity.
 //
+// A third signal is DETECTION-ONLY (#2396): a host may REWRITE authoritative
+// tool-call ids itself (a provider projection re-sanitizing stored composite
+// ids — Prime switching one conversation from Codex to a foreign Responses
+// provider turned call_x|fc_0 into call_x_fc_0 on both sides of every pair).
+// That defeats both claim passes by construction, because both key on the
+// toolCallId. Pairing old→new without host knowledge would be guessing, and
+// misattribution is the expensive failure mode (MESSAGE-IDENTITY.md), so the
+// pass only COUNTS such cases (an inbound twin with identical normalized
+// content under a different toolCallId) and the drift log line names the
+// cause instead of reading as "mutation or deletion".
+//
 // Modes (config `compress.reconcile`, env BILI_FOLD_RECONCILE):
 //   "off"    — disabled (pre-#1921 behavior).
 //   "warn"   — compute + log only, no rewrite.
@@ -93,6 +104,12 @@ function resetFoldDriftState(session: Session): void {
 export interface FoldAnchor {
     /** sha256-16 of role\0contentType\0toolName\0toolCallId\0normalizedText. */
     n: string;
+    /** #2396: sha256-16 of role\0contentType\0toolName\0normalizedText (no
+     *  toolCallId) — set alongside `t`; pairs a missing id with an inbound
+     *  twin whose only difference is a rewritten toolCallId. Anchors
+     *  persisted before #2396 lack it and are backfilled while their bytes
+     *  are still on the wire (see the seed loop below). */
+    m?: string;
     /** Message role at anchor time (tool-claim cross-check). */
     r?: string;
     /** Protocol-stable tool id (tool_use.id / tool_call_id) when present. */
@@ -110,6 +127,11 @@ interface ReconciliationPlan {
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
     unmatched: string[];
+    /** #2396: subset of `unmatched` whose anchor (no-toolCallId norm) matches
+     *  an unclaimed inbound twin carrying a different toolCallId — suspected
+     *  host-side rewrite of authoritative tool-call ids across provider
+     *  projections. Detection only: never claimed, never repaired. */
+    idRewriteSuspects: number;
 }
 
 interface FoldReconcileResult {
@@ -191,9 +213,23 @@ export function normalizedIdentity(message: CoreMessage): string {
     return h.digest("hex").slice(0, 16);
 }
 
+/** #2396: normalized identity with the toolCallId factor removed — pairs a
+ *  message with an inbound twin carrying identical content under a rewritten
+ *  tool-call id. Same work-count seam as normalizedIdentity (#2334). */
+export function normalizedIdentityNoToolCallId(message: CoreMessage): string {
+    normalizedIdentityWork++;
+    const h = createHash("sha256");
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${normalizeMessageText(message.text)}`);
+    return h.digest("hex").slice(0, 16);
+}
+
 function anchorFrom(message: CoreMessage): FoldAnchor {
+    const t = message.toolCallId !== undefined && message.toolCallId !== "" ? message.toolCallId : undefined;
     const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, b: message.text?.length ?? 0 };
-    if (message.toolCallId !== undefined && message.toolCallId !== "") anchor.t = message.toolCallId;
+    if (t !== undefined) {
+        anchor.t = t;
+        anchor.m = normalizedIdentityNoToolCallId(message);
+    }
     return anchor;
 }
 
@@ -227,7 +263,7 @@ export function planReconciliation(
     msgs: CoreMessage[],
     covered: Set<string>,
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byTool: 0, byNorm: 0, unmatched: [] };
+    const plan: ReconciliationPlan = { claims: new Map(), byTool: 0, byNorm: 0, unmatched: [], idRewriteSuspects: 0 };
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) {
@@ -343,6 +379,32 @@ export function planReconciliation(
     for (const id of missing) {
         if (!plan.claims.has(id)) plan.unmatched.push(id);
     }
+
+    // #2396 — detection-only rewrite suspects. Both claim passes key on the
+    // toolCallId itself, so a host that rewrites authoritative tool-call ids
+    // defeats them by construction; pairing old→new without host knowledge
+    // would be guessing (misattribution is the expensive failure mode). Cost:
+    // one no-toolCallId norm per unclaimed candidate carrying a toolCallId,
+    // drift passes only — steady state early-returns above (#2334 discipline).
+    if (plan.unmatched.length > 0) {
+        const noToolWitnesses = new Map<string, string[]>();
+        for (const cand of candidates) {
+            if (claimedCandidates.has(cand.id)) continue;
+            const t = cand.message.toolCallId;
+            if (t === undefined || t === "") continue;
+            const nt = normalizedIdentityNoToolCallId(cand.message);
+            const bucket = noToolWitnesses.get(nt);
+            if (bucket === undefined) noToolWitnesses.set(nt, [t]);
+            else bucket.push(t);
+        }
+        for (const id of plan.unmatched) {
+            const anchor = anchors[id];
+            if (anchor === undefined || anchor.m === undefined || anchor.t === undefined) continue;
+            const witnesses = noToolWitnesses.get(anchor.m);
+            if (witnesses === undefined) continue;
+            if (witnesses.some((w) => w !== anchor.t)) plan.idRewriteSuspects++;
+        }
+    }
     return plan;
 }
 
@@ -440,7 +502,20 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // re-hashing the full text every pass (#1930-2: keeps steady-state
         // rounds near-free on 8K-message histories).
         const prior = anchors[id];
-        if (prior !== undefined) { nextAnchors[id] = prior; anchorCount++; continue; }
+        if (prior !== undefined) {
+            // #2396: anchors persisted before the no-toolCallId norm existed
+            // lack `m`; backfill it while the bytes are still on the wire —
+            // one extra normalization per such anchor, once (same-id means
+            // same identity fields, so recomputing from live bytes is exact).
+            if (prior.t !== undefined && prior.m === undefined) {
+                const message = byId.get(id);
+                nextAnchors[id] = message !== undefined ? anchorFrom(message) : prior;
+            } else {
+                nextAnchors[id] = prior;
+            }
+            anchorCount++;
+            continue;
+        }
         const message = byId.get(id);
         if (message !== undefined) {
             nextAnchors[id] = anchorFrom(message);
@@ -519,7 +594,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             const since = session.metadata[METADATA_DRIFT_SINCE] as number | undefined;
             const span = typeof since === "number" ? `, ${Math.max(1, Math.round((Date.now() - since) / 60000))} min so far` : "";
             if (opts.log !== undefined) {
-                opts.log("error", `${tag}[fold-reconcile] compression substrate appears destroyed: ${plan.unmatched.length} covered id(s) missing with NO anchor match for ${streak} consecutive passes${span} — consistent with a host-native compaction landing outside bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-side history rewrite; bili folds can no longer cover the resent history (#1921)`);
+                opts.log("error", `${tag}[fold-reconcile] compression substrate appears destroyed: ${plan.unmatched.length} covered id(s) missing with NO anchor match for ${streak} consecutive passes${span} — consistent with a host-native compaction landing outside bili's knowledge (dsh native compaction, #1729/#2193), a bulk client-side history rewrite${plan.idRewriteSuspects > 0 ? `, or host-rewritten tool-call ids (${plan.idRewriteSuspects} of them have an inbound twin with identical content under a different toolCallId — keep tool-call ids byte-stable per conversation, #2396)` : ""}; bili folds can no longer cover the resent history (#1921)`);
             }
         }
     }
@@ -530,7 +605,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)`);
@@ -542,7 +617,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // latch, so a later episode reports fresh; the persisted latch also
             // keeps a restarted process silent mid-episode (#2293 terminal state).
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire) (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire)${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} of them have an inbound twin with identical normalized content under a different toolCallId — consistent with the host rewriting authoritative tool-call ids across provider projections (host contract: keep tool-call ids byte-stable per conversation, #2396)` : ""} (#1921)`);
         }
     }
     return {

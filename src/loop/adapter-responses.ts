@@ -29,15 +29,24 @@ interface FunctionCallBuffer {
 // proxy-synthesized ids stay well below this cap (#242).
 const RESPONSES_ITEM_ID_MAX = 64;
 
-/**
- * Heal client rollouts already poisoned with over-long Bili-generated ids
- * (they 400 every request otherwise). Only the msg-proxy-* namespace bili
- * owns is rewritten — in place and deterministically, so repeated requests
- * keep referencing the same replacement id (#242). Provider-issued opaque
- * ids (reasoning rs_*, function_call fc_*, ...) validate against their
- * owner's shape rules and carry replay correspondence, so they must reach
- * the upstream byte-identical (#1474).
- */
+// Client-visible message ids bili mints. The upstream requires message item
+// ids to begin with "msg" (WC-015), so every message item — visibility
+// markers included — is minted under this one prefix.
+const PROXY_MESSAGE_ID_PREFIX = "msg-proxy-";
+// Minted for visibility markers by releases before WC-015. Recognized only so
+// rollouts those versions already poisoned heal at ingress instead of 400ing
+// on every subsequent request.
+const LEGACY_MARKER_MESSAGE_ID_PREFIX = "marker-";
+
+function proxyMessageItemId(outputIndex: number): string {
+    return `${PROXY_MESSAGE_ID_PREFIX}${Date.now()}-${outputIndex}`;
+}
+
+function isBiliMessageId(id: unknown): id is string {
+    return typeof id === "string"
+        && (id.startsWith(PROXY_MESSAGE_ID_PREFIX) || id.startsWith(LEGACY_MARKER_MESSAGE_ID_PREFIX));
+}
+
 export function normalizeResponsesMessageItems(input: unknown): number {
     if (!Array.isArray(input)) return 0;
     let typed = 0;
@@ -58,18 +67,27 @@ export function normalizeResponsesMessageItems(input: unknown): number {
     return typed;
 }
 
+/**
+ * Heal client rollouts already poisoned with Bili-generated ids (they 400
+ * every request otherwise). Only the namespaces bili owns are touched — in
+ * place and deterministically, so repeated requests keep referencing the same
+ * replacement id (#242). Provider-issued opaque ids (reasoning rs_*,
+ * function_call fc_*, ...) validate against their owner's shape rules and
+ * carry replay correspondence, so they must reach the upstream byte-identical
+ * (#1474).
+ */
 export function sanitizeResponsesInputIds(input: unknown): void {
     if (!Array.isArray(input)) return;
     for (const item of input) {
         const rec = item as Record<string, unknown>;
         // Client-visible proxy ids are not upstream item identities; replay the full message instead.
         if (rec?.type === "message" && rec.role === "assistant"
-            && typeof rec.id === "string" && rec.id.startsWith("msg-proxy-")
+            && isBiliMessageId(rec.id)
             && (typeof rec.content === "string" || Array.isArray(rec.content))) {
             delete rec.id;
             continue;
         }
-        if (typeof rec?.id === "string" && rec.id.startsWith("msg-proxy-")
+        if (typeof rec?.id === "string" && rec.id.startsWith(PROXY_MESSAGE_ID_PREFIX)
             && rec.id.length > RESPONSES_ITEM_ID_MAX) {
             rec.id = `msg-fix-${hashId(rec.id)}`;
         }
@@ -421,6 +439,15 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     loggerLog("warn", msg);
                 }
             };
+            // #2405(c): per-response strip total — see plugin.ts twin. n==1 is
+            // covered by its one-shot detail line, so stay silent there.
+            let stripSummarized = false;
+            const maybeSummarizeStrips = () => {
+                if (stripSummarized) return;
+                stripSummarized = true;
+                const total = tagFilter.stats().dropCount;
+                if (total > 1) loggerLog("warn", `[tag-echo] stripped ${total} occurrence(s) total in this response`);
+            };
             for await (const eventStr of iterSseEvents(upstream)) {
                 const explicitType = extractEventType(eventStr);
                 const dataLine = extractDataLine(eventStr);
@@ -474,7 +501,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
-                        const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
+                        const mapped = { id: `${PROXY_MESSAGE_ID_PREFIX}${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
@@ -624,6 +651,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
                     maybeWarnDegenerate("completed");
+                    maybeSummarizeStrips();
                     yield { kind: "done", finishReason: "completed", thinking: sawReasoning } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
                     yield* flushFilter();
@@ -679,7 +707,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
         },
 
         emitText(delta) {
-            return buildMessageItemSequence(`msg-proxy-${Date.now()}-${outputIndex}`, outputIndex++, delta);
+            return buildMessageItemSequence(proxyMessageItemId(outputIndex), outputIndex++, delta);
         },
 
         emitToolCall(call) {
@@ -690,7 +718,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
 
         emitMarker(toolName, result) {
             return buildMessageItemSequence(
-                `marker-${Date.now()}-${outputIndex}`,
+                proxyMessageItemId(outputIndex),
                 outputIndex++,
                 buildVisibilityMarker(toolName, result),
             );

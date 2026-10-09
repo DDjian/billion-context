@@ -11,8 +11,8 @@ import { hoistTrappedToolItems } from "../src/tool-pair-order.js";
 import { validateResponsesBody } from "./wire-contract-fakes.ts";
 
 const cfg = (effort: string): ResponseInputItem => ({ type: "configuration_update", reasoning: { effort } });
-const userMsg = (id: string, text: string): ResponseInputItem => ({ type: "message", id, role: "user", content: [{ type: "input_text", text }] });
-const assistantMsg = (id: string, text: string): ResponseInputItem => ({ type: "message", id, role: "assistant", content: [{ type: "output_text", text }] });
+const userMsg = (id: string, text: string): ResponseInputItem => ({ type: "message", id: `msg_${id}`, role: "user", content: [{ type: "input_text", text }] });
+const assistantMsg = (id: string, text: string): ResponseInputItem => ({ type: "message", id: `msg_${id}`, role: "assistant", content: [{ type: "output_text", text }] });
 
 function adjacentConfigUpdateIndices(items: readonly ResponseInputItem[]): number[] {
     const idx: number[] = [];

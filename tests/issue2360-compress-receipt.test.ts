@@ -73,7 +73,7 @@ test("#2360: non-armed cannot-anchor receipt keeps the kernel retry guidance + l
     const out = applyRanges(args("m00003", "m00003"), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED:"), `got: ${out.slice(0, 120)}`);
     assert.match(out, /cannot be anchored/);
-    assert.match(out, /Run acp_status, then call the compress tool again using only the refs it reports\./, "breaker not armed yet — guidance stays");
+    assert.match(out, /Do not retry this range in any form \u2014 run acp_status and target only the live refs it reports\./, "breaker not armed yet — guidance stays");
     assert.match(out, /\[cause: content-changed/, "unanchored failure without escalation labels content-changed");
 });
 
@@ -89,11 +89,11 @@ test("#2360: armed breaker receipt carries ONE instruction — kernel acp_status
 
     assert.match(f3, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "third consecutive failure arms the breaker");
     assert.match(f3, /cannot be anchored/, "the reason itself stays in the receipt");
-    assert.doesNotMatch(f3, /Run acp_status, then call the compress tool again/, "the contradictory retry guidance is scrubbed while armed");
+    assert.doesNotMatch(f3, /run acp_status and target only the live refs/, "the contradictory dead-ref retry guidance is scrubbed while armed");
     assert.match(f3, /do not poll acp_status/, "the breaker paragraph is the single authority");
     assert.match(f3, /\[cause: content-changed/, "cause label present while armed too");
     // The operator log keeps the full kernel text for diagnosis.
-    assert.ok(logs.some((l) => l.includes("compress FAILED") && l.includes("Run acp_status")), "operator log retains the unscrubbed kernel error");
+    assert.ok(logs.some((l) => l.includes("compress FAILED") && l.includes("run acp_status")), "operator log retains the unscrubbed kernel error");
 });
 
 test("#2360: escalated fold-drift sharpens the cause into substrate destruction", () => {

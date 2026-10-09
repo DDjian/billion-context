@@ -48,6 +48,26 @@ export function hasCompactionTrigger(input: unknown): boolean {
     return last?.type === "compaction_trigger";
 }
 
+// #2372: codex's LOCAL auto-compaction (rollout event type:"compacted") never
+// transits the proxy — no compaction_trigger item, no /responses/compact
+// call. The proxy only sees the aftermath: the next request replays
+// [compaction summary, retained tail…]. Codex's summary template opens with
+// this fixed header (codex-rs core-coder); versioned here like the dsh
+// instruction prefix (#970) — the drift test pins the exact bytes.
+export const CODEX_LOCAL_COMPACTION_SUMMARY_PREFIX = "Another language model started to solve this problem and produced a summary";
+
+// The #2372 signature is TWO content signals together: this template heading
+// a resent message AND the fold coverage decimated below. Either alone is
+// ambiguous (a user pasting template text, or ordinary #1195 churn); together
+// they mean codex replaced the folded head locally and the ACP substrate must
+// rebase onto the compacted view. 8 ≈ the resume-prefix floor; the majority
+// arm keeps small tail-only gaps (client deletion, #1195) out.
+export const CODEX_LOCAL_COMPACTION_MIN_MISSING = 8;
+
+export function carriesCodexLocalCompactionSummary(msgs: readonly { text?: unknown }[]): boolean {
+    return msgs.some((m) => typeof m.text === "string" && m.text.startsWith(CODEX_LOCAL_COMPACTION_SUMMARY_PREFIX));
+}
+
 // Recognize a compaction item WE generated (id prefix or sentinel in the blob).
 // Codex echoes it back in the next request; stripping it keeps the summary
 // sourced from state (no double-count). Real OpenAI blobs carry neither marker,

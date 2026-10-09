@@ -225,7 +225,16 @@ function collectText(node: unknown, out: string[]): void {
     }
 }
 
+// The #2321 tab bar passes an ARRAY of buttons as one child, so every walker
+// must descend into array children like collectText already does.
 function findButton(node: unknown): ElementNode | undefined {
+    if (Array.isArray(node)) {
+        for (const child of node) {
+            const hit = findButton(child);
+            if (hit !== undefined) return hit;
+        }
+        return undefined;
+    }
     if (node !== null && typeof node === "object") {
         const el = node as ElementNode;
         if (el.type === "button") return el;
@@ -238,6 +247,13 @@ function findButton(node: unknown): ElementNode | undefined {
 }
 
 function findTag(node: unknown, type: string): ElementNode | undefined {
+    if (Array.isArray(node)) {
+        for (const child of node) {
+            const hit = findTag(child, type);
+            if (hit !== undefined) return hit;
+        }
+        return undefined;
+    }
     if (node !== null && typeof node === "object") {
         const el = node as ElementNode;
         if (el.type === type) return el;
@@ -247,6 +263,19 @@ function findTag(node: unknown, type: string): ElementNode | undefined {
         }
     }
     return undefined;
+}
+
+function collectButtons(node: unknown, out: ElementNode[] = []): ElementNode[] {
+    if (Array.isArray(node)) {
+        for (const child of node) collectButtons(child, out);
+        return out;
+    }
+    if (node !== null && typeof node === "object") {
+        const el = node as ElementNode;
+        if (el.type === "button") out.push(el);
+        for (const child of el.children ?? []) collectButtons(child, out);
+    }
+    return out;
 }
 
 test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
@@ -392,32 +421,64 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     const tree = settings.component() as ElementNode;
     assert.equal(tree.type, "div");
     assert.notEqual(findTag(tree, "h3"), undefined, "the settings section keeps its own title");
-    const button = findButton(tree);
-    assert.ok(button !== undefined, "origin present renders the open button");
-    assert.equal(typeof button.props?.onClick, "function");
-    const texts: string[] = [];
-    collectText(tree, texts);
-    assert.ok(texts.some((t) => t.includes("http://127.0.0.1:8787")), `button label carries the origin: ${JSON.stringify(texts)}`);
+    // #2321: bound state embeds the real web UI — tab bar plus one iframe at
+    // the embeddable face, defaulting to the overview page. The stub's locale
+    // bind resolves zh, so lang=zh.
+    const frame = findTag(tree, "iframe");
+    assert.ok(frame !== undefined, "origin present renders the embedded iframe");
+    assert.equal(frame.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
+    assert.equal(
+        ((frame.props?.style) as Record<string, unknown> | undefined)?.height,
+        "min(640px, 78vh)",
+        "#2448: frame height follows the host viewport instead of a flat 640px",
+    );
+    const buttons = collectButtons(tree);
+    assert.equal(buttons.length, 5, "four tabs plus the backup open-in-browser button");
+    // #2448: the backup button drops the origin URL from the label (a narrow
+    // host panel squeezed the hint row into a sliver) and keeps it in the
+    // tooltip instead.
+    const openLabel: string[] = [];
+    collectText(buttons[4], openLabel);
+    assert.deepEqual(openLabel, ["打开 Web UI"], "#2448: backup button label carries no origin URL");
+    assert.equal(buttons[4].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
+    const tabLabels: string[] = [];
+    for (const b of buttons.slice(0, 4)) {
+        const bt: string[] = [];
+        collectText(b, bt);
+        tabLabels.push(bt.join(""));
+    }
+    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志"], "tabs mirror the web UI nav terminology");
+    // Tab click moves only the hash — the frame navigates same-document.
+    (buttons[1].props!.onClick as () => void)();
+    const treeAfterTab = settings.component() as ElementNode;
+    const frameAfterTab = findTag(treeAfterTab, "iframe");
+    assert.ok(frameAfterTab !== undefined);
+    assert.equal(frameAfterTab.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/sessions");
+    // The backup button keeps the original jump target.
     const opened: string[] = [];
     sandbox.open = (url: string) => opened.push(url);
-    (button.props!.onClick as () => void)();
+    (buttons[4].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
 
-    // #2125: the bundle panel reuses the probe/button/hint but drops the title
+    // #2125: the bundle panel reuses the probe/frame/hint but drops the title
     // — the plugin detail page draws it.
     calls.length = 0;
     resetHooks();
     const btree = bundle.component() as ElementNode;
     assert.equal(btree.type, "div");
     assert.equal(findTag(btree, "h3"), undefined, "the bundle panel does not repeat the page title");
-    const bButton = findButton(btree);
-    assert.ok(bButton !== undefined, "origin present renders the open button in the bundle panel");
-    assert.equal(typeof bButton.props?.onClick, "function");
-    const btexts: string[] = [];
-    collectText(btree, btexts);
-    assert.ok(btexts.some((x) => x.includes("http://127.0.0.1:8787")), `bundle button label carries the origin: ${JSON.stringify(btexts)}`);
+    const bframe = findTag(btree, "iframe");
+    assert.ok(bframe !== undefined, "origin present renders the embedded iframe in the bundle panel");
+    assert.equal(bframe.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
+    const bButtons = collectButtons(btree);
+    assert.equal(bButtons.length, 5, "the bundle panel offers the same tabs plus backup button");
+    assert.equal(
+        bButtons[bButtons.length - 1].props?.title,
+        "http://127.0.0.1:8787",
+        "bundle backup button tooltip carries the origin",
+    );
     opened.length = 0;
-    (bButton.props!.onClick as () => void)();
+    (bButtons[bButtons.length - 1].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
 
     delete sandbox.__BILI__;
@@ -426,12 +487,14 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     resetHooks();
     const degTree = degraded.bySlot.get("settings.section")!.component() as ElementNode;
     assert.equal(findButton(degTree), undefined);
+    assert.equal(findTag(degTree, "iframe"), undefined, "no frame before the origin resolves");
     const degTexts: string[] = [];
     collectText(degTree, degTexts);
     assert.ok(degTexts.some((t) => t.includes("/acp")), `degraded hint points at /acp: ${JSON.stringify(degTexts)}`);
     resetHooks();
     const degBundleTree = degraded.bySlot.get("plugins.bundle.config")!.component() as ElementNode;
     assert.equal(findButton(degBundleTree), undefined, "the bundle panel degrades like the settings section");
+    assert.equal(findTag(degBundleTree, "iframe"), undefined, "the bundle panel has no frame while degraded");
     const degBundleTexts: string[] = [];
     collectText(degBundleTree, degBundleTexts);
     assert.ok(degBundleTexts.some((t) => t.includes("/acp")), "the bundle degraded hint points at /acp");
@@ -559,12 +622,15 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findButton(first), undefined, "first paint before the probe resolves is still degraded");
+        assert.equal(findTag(first, "iframe"), undefined, "first paint before the probe resolves is still degraded");
         await tick();
         const second = m.component() as ElementNode;
-        const button = findButton(second);
-        assert.ok(button !== undefined, "resolved origin upgrades the entry without a reload");
-        (button.props!.onClick as () => void)();
+        const frame = findTag(second, "iframe");
+        assert.ok(frame !== undefined, "resolved origin upgrades the entry without a reload");
+        assert.equal(frame.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
+        const upButtons = collectButtons(second);
+        assert.equal(upButtons.length, 5, "the upgraded entry shows tabs plus the backup button");
+        (upButtons[upButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         // #2288: resolution no longer STOPs the probe — exactly one fast probe
         // ran so far; the slow follow-up is still pending and gets cancelled
@@ -588,27 +654,36 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        const firstTexts: string[] = [];
-        collectText(first, firstTexts);
-        assert.ok(firstTexts.some((x) => x.includes("http://127.0.0.1:8787")), "the snapshot paints immediately (first-paint hint)");
+        const firstFrame = findTag(first, "iframe");
+        assert.ok(firstFrame !== undefined, "the snapshot paints immediately (first-paint hint)");
+        assert.equal(
+            firstFrame.props?.src,
+            "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview",
+            "the snapshot binds the frame before the live probe lands",
+        );
         await tick();
         const second = m.component() as ElementNode;
-        const texts: string[] = [];
-        collectText(second, texts);
-        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18798")), `stale snapshot upgraded to the live origin: ${JSON.stringify(texts)}`);
-        assert.ok(!texts.some((x) => x.includes(":8787")), "the stale origin is gone from the label");
-        const button = findButton(second);
-        assert.ok(button !== undefined, "the upgraded entry keeps its button");
-        (button.props!.onClick as () => void)();
+        const secondButtons = collectButtons(second);
+        assert.equal(
+            secondButtons[secondButtons.length - 1].props?.title,
+            "http://127.0.0.1:18798",
+            "stale snapshot upgraded to the live origin (backup button tooltip)",
+        );
+        const sframe = findTag(second, "iframe");
+        assert.ok(sframe !== undefined, "the upgraded entry keeps its frame");
+        assert.equal(sframe.props?.src, "http://127.0.0.1:18798/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the corrected live origin");
+        const sButtons = collectButtons(second);
+        assert.equal(sButtons.length, 5, "the upgraded entry shows tabs plus the backup button");
+        (sButtons[sButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18798/__bili/"]);
         m.runCleanups();
     }
 
     {
-        // #2288: after the first resolution the slow phase KEEPS following the
-        // live route — a mid-session re-bind (runtime re-spawn, routed-origin
-        // convergence) moves the button without a reload. Manual clock as in
-        // the #2187 blocks below.
+        // #2288/#2321: after the first resolution the slow phase KEEPS following
+        // the live route — a mid-session re-bind (runtime re-spawn, routed-origin
+        // convergence) moves the frame and the backup button without a reload.
+        // Manual clock as in the #2187 blocks below.
         const pending: Array<{ id: number; delay: number; fn: () => void }> = [];
         let nextId = 1;
         let polls = 0;
@@ -641,10 +716,15 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         }
         await tick();
         const tree = m.component() as ElementNode;
-        const texts: string[] = [];
-        collectText(tree, texts);
-        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18800")), `mid-session re-bind follows the live origin: ${JSON.stringify(texts)}`);
-        assert.ok(!texts.some((x) => x.includes(":18798")), "the pre-re-bind origin is gone from the label");
+        const treeButtons = collectButtons(tree);
+        assert.equal(
+            treeButtons[treeButtons.length - 1].props?.title,
+            "http://127.0.0.1:18800",
+            "mid-session re-bind follows the live origin (backup button tooltip)",
+        );
+        const rframe = findTag(tree, "iframe");
+        assert.ok(rframe !== undefined, "the re-bound entry keeps its frame");
+        assert.equal(rframe.props?.src, "http://127.0.0.1:18800/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the mid-session re-bind");
         m.runCleanups();
     }
 
@@ -660,10 +740,10 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findButton(first), undefined);
+        assert.equal(findTag(first, "iframe"), undefined);
         await tick();
         const second = m.component() as ElementNode;
-        assert.equal(findButton(second), undefined, "a host without the route keeps the entry degraded");
+        assert.equal(findTag(second, "iframe"), undefined, "a host without the route keeps the entry degraded");
         m.runCleanups();
         assert.ok(cleared >= 1, "pending retry timers are cancelled on unmount");
     }
@@ -683,12 +763,15 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         );
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findButton(first), undefined);
+        assert.equal(findTag(first, "iframe"), undefined);
         await tick();
         const second = m.component() as ElementNode;
-        const button = findButton(second);
-        assert.ok(button !== undefined, "the bundle panel upgrades on a resolved origin");
-        (button.props!.onClick as () => void)();
+        const bframe = findTag(second, "iframe");
+        assert.ok(bframe !== undefined, "the bundle panel upgrades on a resolved origin");
+        assert.equal(bframe.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
+        const bUpButtons = collectButtons(second);
+        assert.equal(bUpButtons.length, 5, "the bundle panel offers tabs plus the backup button");
+        (bUpButtons[bUpButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         m.runCleanups();
     }
@@ -722,7 +805,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findButton(first), undefined, "first paint before the probe resolves is still degraded");
+        assert.equal(findTag(first, "iframe"), undefined, "first paint before the probe resolves is still degraded");
         const delays: number[] = [];
         for (;;) {
             await tick();
@@ -733,8 +816,9 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             t.fn();
         }
         const second = m.component() as ElementNode;
-        const button = findButton(second);
-        assert.ok(button !== undefined, "a late-arriving origin upgrades the entry without a reload");
+        const sframe = findTag(second, "iframe");
+        assert.ok(sframe !== undefined, "a late-arriving origin upgrades the entry without a reload");
+        assert.equal(sframe.props?.src, "http://127.0.0.1:9997/__bili/?embed=1&lang=zh#/overview");
         assert.deepEqual(delays.slice(0, 9), Array(9).fill(3000), "fast phase keeps the original cadence");
         assert.ok(delays.length > 9, `probing must continue past the fast phase, got ${delays.length} retries`);
         assert.deepEqual(delays.slice(9), Array(delays.length - 9).fill(10000), "slow phase uses the reduced cadence");
@@ -787,4 +871,55 @@ test("#2125: the manifest declares no dsh.client.inject (pre-0.2 dsh compat)", (
         dsh?: { client?: { inject?: unknown } };
     };
     assert.equal(pkg.dsh?.client?.inject ?? null, null, "dsh.client.inject would break pre-0.2 dsh clients");
+});
+
+test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)", () => {
+    // The embed iframe lives inside a dsh settings column (400-760px), not a
+    // browser tab — the standalone-page table floors (940px/520px + fixed
+    // colgroup) crushed the sessions table there (#2448).
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8");
+    assert.ok(
+        styles.includes(".embed .twide table.data { min-width: 0; }"),
+        "embed drops the standalone-page 940px floor",
+    );
+    assert.ok(
+        styles.includes(".embed .tproc table.data { min-width: 0; }"),
+        "embed drops the protocol-table 520px floor",
+    );
+    assert.ok(
+        styles.includes(".embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }"),
+        "embed reuses the phone-compact column set at any panel width",
+    );
+    // The hidden TDs' <col> tracks still claim their px under table-layout:
+    // fixed unless zeroed — otherwise the SESSION column collapses to 0 and
+    // rows render double-exposed (title overflowing onto adjacent cells).
+    assert.ok(
+        styles.includes("\n    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }"),
+        "phone-compact releases the hidden <col> tracks",
+    );
+    assert.ok(
+        styles.includes(".embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }"),
+        "embed releases the hidden <col> tracks",
+    );
+});
+
+test("#2473: the web face keeps its canvas coupled to the color scheme", () => {
+    // The ?embed=1 face drops its opaque ground (--bg: transparent) to blend
+    // into the host panel. If the document never declares color-scheme, its
+    // default canvas stays WHITE regardless of scheme — so under DSH's dark
+    // theme (prefers-color-scheme: dark) the light-scheme text (#e6edf3)
+    // landed on a white ground and the overview stats went unreadable (#2473).
+    // `color-scheme: light dark` on the BASE :root makes the canvas follow the
+    // SAME prefers-color-scheme signal that drives the palette, so ground and
+    // text stay consistent in BOTH schemes. Pin it in the base block (before
+    // the dark @media), not buried inside one scheme's override — that is the
+    // exact placement that keeps the coupling symmetric.
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8");
+    const declIdx = styles.search(/color-scheme:\s*light\s+dark/);
+    const mediaIdx = styles.indexOf("@media (prefers-color-scheme: dark)");
+    assert.notEqual(declIdx, -1, "declares color-scheme: light dark on :root");
+    assert.ok(
+        mediaIdx !== -1 && declIdx < mediaIdx,
+        "color-scheme sits in the base :root (before the dark @media) so both schemes inherit it",
+    );
 });

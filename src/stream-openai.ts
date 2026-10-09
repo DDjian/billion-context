@@ -57,7 +57,7 @@ function* rewriteOpenaiJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const requestText = JSON.stringify(ctx.messages);
     if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText) || (absorbArmed && containsToolCallEmissionText(existingText)))) {
-        ctx.log(`[warn: tag echo] non-stream openai output contains ACP echo (render tags/markers/internal artifacts), stripped: ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
+        ctx.log(`[tag-echo] stripped: non-stream openai output ACP echo (render tags/markers/internal artifacts): ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
         existingText = stripAcpTags(existingText, absorbArmed, requestText);
         msg.content = existingText;
     }

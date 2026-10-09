@@ -69,12 +69,16 @@ export function mergeCompress(
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     const outputSteeringLevels = [global?.outputSteering, provider?.outputSteering, model?.outputSteering].filter(Boolean) as NonNullable<CompressSettings["outputSteering"]>[];
     const priceProfileLevels = [global?.priceProfile, provider?.priceProfile, model?.priceProfile].filter(Boolean) as NonNullable<CompressSettings["priceProfile"]>[];
+    // `tierNudgeTokens` is another nested-object field merged sub-field-wise
+    // like `absorb`: a model-level t2 must not discard a provider-level t1.
+    const tierNudgeLevels = [global?.tierNudgeTokens, provider?.tierNudgeTokens, model?.tierNudgeTokens].filter(Boolean) as NonNullable<CompressSettings["tierNudgeTokens"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
+        tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
         preserveRecentMessages: pick("preserveRecentMessages"),
@@ -215,8 +219,14 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  - `maxContextLimit` → `nudge.maxContextLimitPct` (force-nudge trigger).
  *  - `emergencyThresholdPercent` → `nudge.emergencyThresholdPct` +
  *    `truncate.threshold` (emergency + hard-truncate).
- *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
- *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
+  *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
+  *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
+  *  - `tierNudgeTokens` → `nudge.tierGrowthTokens` (per-tier token-mass
+  *    thresholds, acp-kernel >= 0.0.108): each set sub-field pins that tier's
+  *    mass trigger independently; unset sub-fields fall back to the derived
+  *    defaults INSIDE the kernel (T1 = growth step, T2/T3 = ×1.5), so a
+  *    partially-set object still resolves fully. Absent leaves
+  *    `base.nudge.tierGrowthTokens` untouched.
  *  - `preserveRecentMessages` / `preserveRecentTokens` → top-level Config.
   *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
   *    `compress.minCompressRange`. The unit is characters.
@@ -293,6 +303,13 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     if (s.nudgeGrowthTokens !== undefined && s.nudgeGrowthTokens > 0) {
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
+    }
+    if (s.tierNudgeTokens !== undefined) {
+        const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
+        if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
+        if (typeof s.tierNudgeTokens.t2 === "number") tg.t2 = s.tierNudgeTokens.t2;
+        if (typeof s.tierNudgeTokens.t3 === "number") tg.t3 = s.tierNudgeTokens.t3;
+        if (tg.t1 !== undefined || tg.t2 !== undefined || tg.t3 !== undefined) nudge.tierGrowthTokens = tg;
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;

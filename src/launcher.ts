@@ -1228,11 +1228,15 @@ export async function resolveLauncherWindow(
  *
  * Injecting `-c model_context_window=<W> -c model_auto_compact_token_limit=<W>`
  * (W = bili's effective window) makes codex's auto-compact threshold 90%×W —
- * ACP (≈55%×W) always fires first, and codex's LOCAL compaction (benign for
- * bili: same-session truncation the kernel deactivates by message id) only
- * backstops when ACP fails, before codex's 95% hard cap. codex clamps both
- * values to its own max_context_window, so an over-generous W degrades to
- * codex's own perception instead of overshooting.
+ * ACP (≈55%×W) always fires first, and codex's LOCAL compaction only
+ * backstops when ACP fails, before codex's 95% hard cap. Local compaction is
+ * NOT benign when it does fire across a fold boundary (#2372): the compacted
+ * replay replaces the folded head wholesale, so the proxy detects the
+ * signature (summary template + decimated fold coverage) and rebases the ACP
+ * state onto the compacted view (src/server/prepare-responses.ts). Keeping
+ * ACP first just minimizes how often that recovery path runs. codex clamps
+ * both values to its own max_context_window, so an over-generous W degrades
+ * to codex's own perception instead of overshooting.
  *
  * Returns [] (no injection) when:
  *  - no model is configured (nothing to resolve a window for),

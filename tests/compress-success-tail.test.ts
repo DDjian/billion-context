@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { CoreMessage } from "acp-kernel";
+import type { CoreMessage, CompressibleRange, NudgeDecision } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
@@ -50,19 +50,88 @@ function runApply(ctx: Ctx, args: unknown): string {
     return applyRanges(parseCompressInput(args), ctx).text;
 }
 
-test("#1387: success with remaining ranges appends the fresh range list (pi #420)", () => {
+// #2404: hand-build a prepare-time nudge offer so the tail's pre-fold baseline is
+// controlled independently of the kernel's range builder. postCompressTail reads
+// only .compressibleRanges and .tier, hence the partial cast.
+function offerRange(startRef: string, endRef: string, count: number, tokens = 8000): CompressibleRange {
+    return { startRef, endRef, count, tokens, chars: tokens * 4, toolPct: 0, textPct: 100 };
+}
+function setOffer(ctx: Ctx, ranges: CompressibleRange[]): void {
+    ctx.lastNudge = { compressibleRanges: ranges, tier: null } as unknown as NudgeDecision;
+}
+
+test("#2404: folding a subset of the pre-fold offer keeps advertising the rest", () => {
+    // Offer carried two disjoint ranges; the model folds only the first. The
+    // receipt must still advertise the second (owner rule: "offered 3, folded 2,
+    // show the 1") — unlike the band-aid, this does NOT suppress live offers.
     const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
-    // preserveRecentMessages: 2 (+ token zone off) → only m00008–m00009 stay
-    // protected, so m00005–m00007 remain raw-compressible after folding m00001–m00004.
     const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
     ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00004", 4), offerRange("m00005", "m00007", 3)]);
     const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
-    assert.ok(out.includes(RANGES_HEADER), `missing ranges header:\n${out}`);
-    assert.ok(out.includes("m00005"), `remaining range must name m00005:\n${out}`);
-    assert.ok(out.includes("m00007"), `remaining range must reach m00007:\n${out}`);
-    assert.ok(!out.includes("m00008"), "protected recent zone must not be advertised:\n" + out);
-    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not appear while ranges remain:\n" + out);
+    assert.ok(out.includes(RANGES_HEADER), "remaining offered range must be advertised:\n" + out);
+    assert.ok(out.includes("m00005"), "unfolded offered range must be listed:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while an offer remains:\n" + out);
+});
+
+test("#2404: a range protected at nudge time never leaks into the receipt (no zero-growth chained fold)", () => {
+    // THE regression: after the fold, m00005–m00007 are raw-compressible in LIVE
+    // state (preserveRecentMessages: 2 keeps only m00008–m00009 protected), so a
+    // post-fold RECOMPUTE would list them and chain a second zero-growth fold.
+    // But they were NOT part of the pre-fold offer (still inside the protection
+    // window when the nudge fired) → pinning the tail to that offer keeps them
+    // out. A regression to the recompute path makes m00005 leak and fail here.
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(!out.includes(RANGES_HEADER), "no ranges may be advertised once the whole offer folded:\n" + out);
+    assert.ok(!out.includes("m00005"), "a not-yet-offered (protected-at-nudge) range must NOT leak:\n" + out);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal fires once every offered range folded:\n" + out);
+});
+
+test("#2404: folding every offered range emits the stop signal", () => {
+    // Both offered ranges folded in one call → nothing left to recommend → the
+    // #521 stop signal ("压缩完了的描述").
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00004", 4), offerRange("m00005", "m00007", 3)]);
+    const out = runApply(ctx, { content: [
+        { startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+        { startId: "m00005", endId: "m00007", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+    ]});
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(!out.includes(RANGES_HEADER), "no ranges may remain once every offer folded:\n" + out);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must fire when the whole offer is consumed:\n" + out);
+});
+
+test("#2404: a rejected range keeps advertising the still-offered remainder (recovery is not cadence)", () => {
+    // Offer carried two ranges; the call folds the first but submits an UNKNOWN
+    // ref alongside → a PARTIAL success (blocksCreated>0, errors.length>0). The
+    // still-offered second range must remain advertised, and no stop verdict may
+    // fire while an error is owed an answer (#1495/#847, pi #521 gate).
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00004", 4), offerRange("m00006", "m00007", 2)]);
+    const out = runApply(ctx, { content: [
+        { startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+        { startId: "m99999", endId: "m99999", summary: "THIS-RANGE-IS-UNKNOWN-AND-MUST-BE-REJECTED-BUT-STILL-LONG-ENOUGH" },
+    ]});
+    if (out.startsWith("[Compression FAILED")) {
+        // Kernel treated the batch atomically in this version — nothing applied;
+        // the failure path carries its own guidance, so the tail contract is moot.
+        return;
+    }
+    assert.ok(out.startsWith("[Compressed"), `partial success expected, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes("Errors:"), `the rejected unknown ref must surface as an error:\n${out}`);
+    assert.ok(out.includes(RANGES_HEADER), "still-offered range must remain advertised:\n" + out);
+    assert.ok(out.includes("m00006"), "the unfolded offered range must be listed:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "no stop verdict while an error is owed:\n" + out);
 });
 
 test("#1387: clean success that drains every compressible range emits the stop signal (pi #521)", () => {

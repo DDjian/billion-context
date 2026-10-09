@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
     normalizeMessageText,
     normalizedIdentity,
+    normalizedIdentityNoToolCallId,
     planReconciliation,
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
@@ -23,7 +24,10 @@ function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage
 
 function anchorOf(m: CoreMessage): FoldAnchor {
     const a: FoldAnchor = { n: normalizedIdentity(m), r: m.role, b: m.text?.length ?? 0 };
-    if (m.toolCallId) a.t = m.toolCallId;
+    if (m.toolCallId) {
+        a.t = m.toolCallId;
+        a.m = normalizedIdentityNoToolCallId(m);
+    }
     return a;
 }
 
@@ -652,8 +656,8 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         assert.equal(result.byTool, 8);
         assert.equal(result.byNorm, 0);
         assert.equal(result.unmatched, 0);
-        assert.equal(normalizedIdentityWorkCount(), 8,
-            "exactly the 8 claim-anchor rebuilds — zero wasted candidate norms");
+        assert.equal(normalizedIdentityWorkCount(), 16,
+            "exactly the 8 claim-anchor rebuilds × 2 (full norm + #2396 no-tool norm) — zero wasted candidate norms");
         assert.deepEqual(
             (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
             ["b0", ...Array.from({ length: 8 }, (_, i) => `t${i + 1}-new`), "b9"],
@@ -686,7 +690,129 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         assert.equal(result.byTool, 4);
         assert.equal(result.byNorm, 4);
         assert.equal(result.unmatched, 0);
-        assert.equal(normalizedIdentityWorkCount(), 12,
-            "8 claim-anchor rebuilds + 4 unclaimed-candidate norms, nothing else");
+        assert.equal(normalizedIdentityWorkCount(), 16,
+            "4 tool claim-anchor rebuilds × 2 (#2396 no-tool norm rides along) + 4 plain claim rebuilds + 4 unclaimed-candidate norms");
+    });
+});
+
+describe("rewrite-suspect detection (#2396)", () => {
+    // A host may rewrite authoritative tool-call ids across provider
+    // projections (Prime: call_x|fc_0 → call_x_fc_0 on both sides of every
+    // pair). Both claim passes key on the toolCallId, so such pairs defeat
+    // reconciliation by construction; the module must COUNT them (detection
+    // only) and never claim or repair onto them.
+    const oldCall = msg("tc1", "tool_result", "payload body words", { toolCallId: "call_seed|fc_0", toolName: "probe" });
+    const rewrittenTwin = msg("tc1-rw", "tool_result", "payload body words", { toolCallId: "call_seed_fc_0", toolName: "probe" });
+
+    test("identical-content twin under a different toolCallId is counted, never claimed", () => {
+        const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [rewrittenTwin], new Set(["tc1"]));
+        assert.equal(plan.claims.size, 0, "no host knowledge → no pairing");
+        assert.deepEqual(plan.unmatched, ["tc1"]);
+        assert.equal(plan.idRewriteSuspects, 1);
+    });
+
+    test("stable toolCallId with churned bytes still claims (unchanged path)", () => {
+        const churned = msg("tc1-new", "tool_result", "payload body  words\r\n", { toolCallId: "call_seed|fc_0", toolName: "probe" });
+        const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [churned], new Set(["tc1"]));
+        assert.equal(plan.byTool, 1);
+        assert.deepEqual([...plan.claims.entries()], [["tc1", "tc1-new"]]);
+        assert.equal(plan.idRewriteSuspects, 0);
+    });
+
+    test("genuinely edited content under a new id is NOT a suspect", () => {
+        const edited = msg("tc1-edit", "tool_result", "completely different body", { toolCallId: "call_seed_fc_0", toolName: "probe" });
+        const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [edited], new Set(["tc1"]));
+        assert.deepEqual(plan.unmatched, ["tc1"]);
+        assert.equal(plan.idRewriteSuspects, 0, "content differs → real edit, not a rewrite");
+    });
+
+    test("pre-#2396 persisted anchors (no m) stay residual-pinned", () => {
+        const v0: FoldAnchor = { n: normalizedIdentity(oldCall), r: oldCall.role, b: oldCall.text!.length, t: oldCall.toolCallId };
+        const plan = planReconciliation(["tc1"], { tc1: v0 }, [rewrittenTwin], new Set(["tc1"]));
+        assert.deepEqual(plan.unmatched, ["tc1"]);
+        assert.equal(plan.idRewriteSuspects, 0, "without the no-tool norm there is no evidence to pair on");
+    });
+
+    type LogLine = { level: string; msg: string };
+    function makeOpts(logs: LogLine[]): ReconcileOptions & { mode: "repair" } {
+        return { sessionId: "s1", mode: "repair", log: (level: string, m: string) => logs.push({ level, msg: m }) };
+    }
+    const errorLines = (logs: LogLine[]) => logs.filter((l) => l.level === "error");
+
+    test("provider-switch rewrite: 10 unmatched pairs stay unrepaired, named in logs, escalate once", () => {
+        const ids = ["b0", ...Array.from({ length: 10 }, (_, i) => `t${i + 1}`), "b9"];
+        const originals: CoreMessage[] = [msg("b0", "user", "bookend zero")];
+        for (let i = 1; i <= 10; i++) originals.push(msg(`t${i}`, "tool_result", `tool payload ${i}`, { toolCallId: `call_${i}|raw`, toolName: "probe" }));
+        originals.push(msg("b9", "assistant", "bookend nine"));
+        const session: Session = {
+            state: { blocks: [{ active: true, effectiveMessageIds: [...ids] }] },
+            metadata: {},
+        } as unknown as Session;
+        reconcileFoldCoverage(session, originals, makeOpts([])); // seed anchors + order
+
+        const rewritten = (): CoreMessage[] => [
+            msg("b0", "user", "bookend zero"),
+            ...Array.from({ length: 10 }, (_, i) => msg(`t${i + 1}-rw`, "tool_result", `tool payload ${i + 1}`, { toolCallId: `call_${i + 1}_raw`, toolName: "probe" })),
+            msg("b9", "assistant", "bookend nine"),
+        ];
+
+        const logs: LogLine[] = [];
+        resetNormalizedIdentityWork();
+        const first = reconcileFoldCoverage(session, rewritten(), makeOpts(logs));
+        assert.equal(first.kind, "unmatched");
+        assert.equal(first.unmatched, 10);
+        assert.equal(first.claims, 0);
+        assert.equal(normalizedIdentityWorkCount(), 20,
+            "10 pass-2 candidate norms + 10 no-tool witness norms; anchor reuse pays 0");
+        // The first drift pass is the EVIDENCE pass: it rolls the order
+        // backbone onto the rewritten ids, so later passes find the missing
+        // ids outside the aligned region — zero work, region-bounded detection
+        // (#2334 discipline: steady/drift state must stay near-free).
+        const firstWarn = logs.find((l) => l.level === "warn");
+        assert.ok(firstWarn !== undefined, "first drift pass logs the per-pass warn");
+        assert.match(firstWarn.msg, /10 of them have an inbound twin with identical normalized content under a different toolCallId/);
+        assert.match(firstWarn.msg, /#2396/);
+
+        for (let pass = 2; pass <= 3; pass++) {
+            resetNormalizedIdentityWork();
+            const result = reconcileFoldCoverage(session, rewritten(), makeOpts(logs));
+            assert.equal(result.kind, "unmatched");
+            assert.equal(result.unmatched, 10);
+            assert.equal(normalizedIdentityWorkCount(), 0, "rolled backbone: empty region, no norms paid");
+        }
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            ids,
+            "detection only — the fold must never rewrite onto guessed pairings");
+        assert.equal(errorLines(logs).length, 1, "third consecutive total-loss pass escalates once");
+        const err = errorLines(logs)[0];
+        assert.match(err.msg, /substrate appears destroyed/);
+        // The evidence window closed with the backbone roll, so the escalation
+        // error must NOT claim rewrite suspects it cannot see on its own pass —
+        // the cause lives in the first drift warn above (honest-output rule).
+        assert.doesNotMatch(err.msg, /host-rewritten tool-call ids/);
+        assert.equal(logs.filter((l) => l.level === "warn").length, 2, "passes 1-2 warn; pass 3 is the single error line");
+    });
+
+    test("v0 anchors backfill their no-tool norm while bytes are still on the wire", () => {
+        const ids = Array.from({ length: 10 }, (_, i) => `t${i + 1}`);
+        const originals: CoreMessage[] = ids.map((id, i) =>
+            msg(id, "tool_result", `backfill payload ${i + 1}`, { toolCallId: `bf_${i + 1}|old`, toolName: "probe" }));
+        const v0Anchors: Record<string, FoldAnchor> = {};
+        for (const m of originals) {
+            v0Anchors[m.id!] = { n: normalizedIdentity(m), r: m.role, b: m.text!.length, t: m.toolCallId };
+        }
+        const session: Session = {
+            state: { blocks: [{ active: true, effectiveMessageIds: [...ids] }] },
+            metadata: { foldAnchors: v0Anchors, foldAnchorOrder: [...ids] },
+        } as unknown as Session;
+        const opts: ReconcileOptions = { mode: "repair", sessionId: "bf", log: () => {} };
+        const result = reconcileFoldCoverage(session, originals, opts);
+        assert.equal(result.kind, "resend");
+        const anchors = session.metadata!.foldAnchors as Record<string, FoldAnchor>;
+        for (const m of originals) {
+            assert.equal(anchors[m.id!]?.m, normalizedIdentityNoToolCallId(m), "m backfilled from live bytes");
+            assert.equal(anchors[m.id!]?.n, normalizedIdentity(m));
+        }
     });
 });

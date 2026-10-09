@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
@@ -640,6 +641,175 @@ test("legit angle-bracket text survives the loosened filter (#673)", () => {
     }
 });
 
+// #2348: the self-closing render forms (<name attrs/>, bare <name/>) are the
+// documented strip scope (module header) yet leaked on every path: whole-text
+// had no matcher for the bare form at all, and streaming read the attrs form
+// as an UNCLOSED opening whose EOF swallow then dropped the following prose
+// (measured 57 -> 3 chars). The slash must stay mandatory so a genuinely
+// unterminated open keeps its hold/swallow path.
+const SELF_ATTRS = `${OPEN}tokens="0" type="text"/>`;
+const SELF_BARE = `${LT}acp/>`;
+
+test("stripAcpTags removes self-closing render forms, keeping surrounding prose (#2348)", () => {
+    assert.equal(stripAcpTags(`前文 ${SELF_ATTRS} 后文`), "前文  后文");
+    assert.equal(stripAcpTags(`前文 ${SELF_BARE} 后文`), "前文  后文");
+    assert.equal(stripAcpTags(`${SELF_ATTRS}\n${SELF_ATTRS}\n${SELF_BARE}`), "\n\n");
+    // typo'd acplike names follow the same rule as their paired form (#673)
+    assert.equal(stripAcpTags(`${LT}acpi/>`), "");
+});
+
+test("self-close stripping never touches ordinary markup or non-acplike names (#2348)", () => {
+    const safe = [
+        `use ${LT}br/> here`,
+        `see ${LT}caption/> and ${LT}app/> docs`,
+        "a < b and b > c",
+    ];
+    for (const s of safe) {
+        assert.equal(stripAcpTags(s), s);
+        for (let split = 0; split <= s.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+            assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+        }
+    }
+});
+
+test("streaming filter matches stripAcpTags for self-closing forms at every split position (#2348)", () => {
+    const cases = [
+        `前文 ${SELF_ATTRS} 后文 prose continues.`,
+        `前文 ${SELF_BARE} 后文 prose continues.`,
+        `lead ${SELF_ATTRS}${SELF_ATTRS}${SELF_BARE} tail`,
+        `${SELF_ATTRS}\n${SELF_ATTRS}\n${SELF_ATTRS}`,
+        `好的${SELF_BARE}完毕`,
+    ];
+    for (const full of cases) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+        for (let seed = 1; seed < 5; seed++) {
+            const f = createTagEchoFilter();
+            let out = "";
+            let rest = full;
+            while (rest.length > 0) {
+                const take = (seed * 7 + rest.length) % rest.length + 1;
+                out += f.push(rest.slice(0, take));
+                rest = rest.slice(take);
+            }
+            out += f.flush();
+            assert.equal(out, expected, `seed=${seed} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
+test("streaming filter accounts self-closing echoes as dropped, not swallowed prose (#2348)", () => {
+    const full = `前文 ${SELF_ATTRS} 后文 prose continues.`;
+    let dropped = "";
+    const f = createTagEchoFilter((s) => { dropped = s; });
+    let visible = "";
+    for (let i = 0; i < full.length; i += 5) visible += f.push(full.slice(i, i + 5));
+    visible += f.flush();
+    assert.equal(visible, "前文  后文 prose continues.", "the prose after the self-close must survive");
+    assert.ok(f.dropped(), "the echo is accounted as dropped");
+    assert.ok(dropped.includes("acp"), "the drop callback saw the tag bytes");
+});
+
+test("self-closing forms engage the streaming gates, non-acplike names do not (#2348)", () => {
+    assert.equal(containsRenderTagText(SELF_BARE), true);
+    assert.equal(containsRenderTagText(SELF_ATTRS), true);
+    assert.equal(mayStartRenderTag(`chunk ${SELF_BARE}`), true);
+    assert.equal(mayStartRenderTag(`chunk ${LT}acp/`), true);
+    assert.equal(mayStartRenderTag(`prose ${LT}br/>`), false);
+    assert.equal(mayStartRenderTag(`prose ${LT}caption/>`), false);
+});
+
+test("anthropic adapter keeps prose after a self-closing echo (#2348)", async () => {
+    const tagged = `好的 ${SELF_ATTRS}结论`;
+    const parts: string[] = [];
+    for (let i = 0; i < tagged.length; i += 9) parts.push(tagged.slice(i, i + 9));
+    const sseParts: string[] = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 100 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        ...parts.map((p) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } })}\n\n`),
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ];
+    const out = await drain(sseFromStrings(sseParts), createAnthropicAdapter({ model: "test" }));
+    const texts = [...out.matchAll(/"text_delta","text":"((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`) as string);
+    assert.equal(texts.join(""), "好的 结论", "no prose may be swallowed by the self-closing echo");
+});
+
+// #2348 owner decision §4 (instance C): a valid acplike open + single bare ref
+// closed by a FULLWIDTH corrupt close must die atomically in BOTH modes via
+// the existing drop callback — never silently swallowed, never leaking orphan
+// markup. The specimen bytes are the real ones (U+FF1C fullwidth less-than).
+const C_SPECIMEN = `${OPEN}tokens="38" string="true"\x3em00282${CLOSE}\n${OPEN}tokens="44" type="text"\x3em00281${LT}/\uFF1C\uFF1CDSML\uFF1C\uFF1C parameter>`;
+
+test("fullwidth-corrupt close dies atomically with its ref span, whole-text (#2348 §4)", () => {
+    assert.equal(stripAcpTags(C_SPECIMEN), "\n", "both spans go, only the newline survives");
+    assert.equal(stripAcpTags(`lead ${C_SPECIMEN} tail`), "lead \n tail", "no orphan ref+close residue");
+});
+
+test("streaming filter matches whole-text for the corrupt-close specimen at every split (#2348 §4)", () => {
+    const full = `lead ${C_SPECIMEN} tail`;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+    }
+});
+
+test("the widened close path drops via the warn callback, not silently (#2348 §4 constraint b)", () => {
+    // Mid-stream is the sharp case: without the widened class the fullwidth
+    // close never ends the swallow, the cap releases the ref+garbage back into
+    // the output, and only the trailing pair gets stripped.
+    const tag2 = `${OPEN}tokens="44" type="text"\x3em00281${LT}/\uFF1C\uFF1CDSML\uFF1C\uFF1C parameter>`;
+    const pair2 = `${LT}acpi tokens="1" type="text"\x3em00999${LT}/acpi\x3e`;
+    const stream = `${tag2}  more prose ${pair2}`;
+    const expected = stripAcpTags(stream);
+    assert.equal(expected, "  more prose ", "the span dies atomically, prose survives");
+    let warned = "";
+    const f = createTagEchoFilter((s) => { warned = s; });
+    let visible = "";
+    for (let i = 0; i < stream.length; i += 7) visible += f.push(stream.slice(i, i + 7));
+    visible += f.flush();
+    assert.equal(visible, expected, "streaming matches whole-text");
+    assert.ok(warned.length > 0, "the drop callback fired — the span went through drop(), not an EOF fallback");
+    assert.ok(f.dropped(), "accounted as dropped");
+});
+
+test("empty-name close is NOT swallowed by the widened close class (#2348 §4 constraint a)", () => {
+    const s = `ref m1234${LT}/> stays`;
+    assert.equal(stripAcpTags(s), s, "{1,32} keeps a minimum char: an empty-name close stays visible");
+    const f = createTagEchoFilter();
+    assert.equal(f.push(s) + f.flush(), s, "streaming agrees");
+});
+
+test("bili's own retrieval pointer marker survives both modes untouched (#2348 negative sample)", () => {
+    // The v1 census probe over-counted self-closing tags because \\b holds at
+    // the p/- boundary and swept in bili's own CCR export pointer — this is the
+    // family that must stay a permanent false negative.
+    const marker = `${LT}acp-retrieved-file ref="m0123" path="/tmp/x.txt" lines="42"/>`;
+    const s = `pointer ${marker} note`;
+    assert.equal(stripAcpTags(s), s);
+    for (let split = 0; split <= s.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+        assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+    }
+});
+
+test("attr-drifted self-closing (H-class sample) is stripped in both modes (#2348)", () => {
+    const h = `${LT}acp test="m00430"/>`;
+    assert.equal(stripAcpTags(`a ${h} b`), "a  b");
+    const f = createTagEchoFilter();
+    assert.equal(f.push(`a ${h} b`) + f.flush(), "a  b");
+});
+
 test("filter stats() accumulates lifetime input/output/dropped (#673)", () => {
     const first = `hello ${TAG("m00123")}`;
     const f = createTagEchoFilter();
@@ -657,7 +827,7 @@ test("degenerateTurnWarning fires only on terminal zero-text zero-tool turns (#6
         reason: "end_turn" as string | undefined,
         terminalReason: "end_turn",
         toolCalls: 0,
-        text: { inputChars: 63, outputChars: 0, dropped: true },
+        text: { inputChars: 63, outputChars: 0, dropped: true, dropCount: 1 },
         sawThinking: true,
         wire: "anthropic",
     };
@@ -667,8 +837,8 @@ test("degenerateTurnWarning fires only on terminal zero-text zero-tool turns (#6
     assert.match(hit ?? "", /stripped as render-tag echo/);
     assert.equal(degenerateTurnWarning({ ...base, reason: "tool_use" }), null);
     assert.equal(degenerateTurnWarning({ ...base, toolCalls: 1 }), null);
-    assert.equal(degenerateTurnWarning({ ...base, text: { inputChars: 5, outputChars: 3, dropped: false } }), null);
-    assert.match(degenerateTurnWarning({ ...base, sawThinking: false, text: { inputChars: 0, outputChars: 0, dropped: false } }) ?? "", /no visible text emitted/);
+    assert.equal(degenerateTurnWarning({ ...base, text: { inputChars: 5, outputChars: 3, dropped: false, dropCount: 0 } }), null);
+    assert.match(degenerateTurnWarning({ ...base, sawThinking: false, text: { inputChars: 0, outputChars: 0, dropped: false, dropCount: 0 } }) ?? "", /no visible text emitted/);
 });
 
 test("anthropic adapter warns on degenerate typo-tag-only turn (#673)", async () => {
@@ -769,4 +939,149 @@ test("streaming filter swallows a wrapped-turn imitation push by push, never emi
     visible += f.flush();
     assert.equal(visible, "", "nothing of the wrapped turn reaches the client");
     assert.ok(f.stats().dropped, "the span is accounted as dropped");
+});
+
+// #2348 pain-point corpus: real per-message leak samples from the issue's
+// evidence zip (05-degenerate-tags: paired attr-drift forms embedded in CJK
+// prose; instance-c-message: fullwidth-corrupt close; healthy-control: one
+// canonical pair). Invariant: ZERO markup bytes reach the client in either
+// mode, and streaming agrees with whole-text at every chunk size.
+const PAINPOINT_DIR = new URL("./fixtures/painpoint-2348/", import.meta.url);
+const PAINPOINT_FILES = [
+    "sample-01-seq409-turn4.txt",
+    "sample-02-seq424-turn4.txt",
+    "sample-03-seq429-turn4.txt",
+    "sample-04-seq454-turn4.txt",
+    "sample-05-seq464-turn4.txt",
+    "sample-06-seq469-turn4.txt",
+    "sample-07-seq474-turn4.txt",
+    "sample-08-seq522-turn8.txt",
+    "instance-c-message.txt",
+    "healthy-control-message.txt",
+];
+
+test("#2348 pain-point corpus: zero markup reaches the client; stream == whole-text at every chunk size", () => {
+    for (const name of PAINPOINT_FILES) {
+        const input = readFileSync(new URL(name, PAINPOINT_DIR), "utf8");
+        const wt = stripAcpTags(input);
+        assert.ok(!wt.includes(LT), `${name}: whole-text output leaves markup bytes`);
+        for (const chunk of [1, 7, 32]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < input.length; i += chunk) out += f.push(input.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, wt, `${name} chunk=${chunk}: streaming diverges from whole-text`);
+        }
+    }
+});
+
+// #2348: pre-fix, an attr-self-closing render tag was read as an unclosed
+// opening whose swallow state ate everything after it — the H-class shape
+// below lost the model's ENTIRE visible reply before the fix. Pin the loss
+// mode, not just the strip: output must equal the clean truth byte-for-byte.
+test("#2348 self-closing forms keep all following prose byte-for-byte (pre-fix swallow-loss mode)", () => {
+    const cases: Array<[string, string]> = [
+        ["attr-selfclose mid-prose", `先说结论：缓存层没问题。\n\n${LT}acp tokens="12" type="text"/\x3e\n\n真正的原因在序列化那一环，下面展开。`],
+        ["bare selfclose line-head", `${LT}acp/\x3e\n第二点，重试风暴来自上游限流而不是本地。`],
+        ["mixed shapes one message", `核对完毕。\n${LT}acp tokens="38" string="true"\x3em00282${LT}/acp\x3e \n中间还夹了一个 ${LT}acp tokens="0" type="text"/\x3e 之类的残留。\n总之结论不变：先修序列化。`],
+        ["H-class attr drift", `${LT}acp test="m00430"/\x3e\n收到，继续执行。`],
+    ];
+    for (const [label, input] of cases) {
+        const truth = stripAcpTags(input);
+        const f = createTagEchoFilter();
+        let out = "";
+        for (let i = 0; i < input.length; i += 7) out += f.push(input.slice(i, i + 7));
+        out += f.flush();
+        assert.equal(out, truth, `${label}: prose after the self-close was lost`);
+        assert.ok(!out.includes(LT), `${label}: markup leaked`);
+        assert.ok(f.stats().dropped, `${label}: drop accounting (warn path)`);
+    }
+});
+
+// #2348 v4 corpus: the five new attr-drift families from the owner's
+// EMIT-COUNTS audit (13-NEW-SHAPES-FIXTURES). The four paired shapes are
+// ref-body echoes with impossible attribute sets (style / state / type_orig
+// third attribute / hyphenated text-coercion) — stripped atomically in both
+// modes like every other paired echo. The cache fixture is different: a
+// LONE attrs-bearing opening followed by prose at EOF; whole-text keeps the
+// prose (LONE_OPEN drops only the open) while streaming drops it (#1720
+// wrapped-turn semantics, pre-existing — verified identical on pre-fix
+// faea7caf4). Owner's own audit downgrades this family (0 ref-adjacent hits),
+// so the divergence is pinned as-is rather than "fixed" against phantom data.
+const NEWSHAPES_DIR = new URL("./fixtures/painpoint-2348/new-shapes/", import.meta.url);
+
+test("#2348 v4: five attr-drift families — zero markup in either mode", () => {
+    for (const name of ["type_orig.tag.txt", "style.tag.txt", "state.tag.txt", "text-coercion.tag.txt"]) {
+        const input = readFileSync(new URL(name, NEWSHAPES_DIR), "utf8");
+        assert.ok(input.includes(LT), name + ": fixture must contain markup");
+        const wt = stripAcpTags(input);
+        assert.equal(wt, "", name + ": whole-text must strip the tag atomically");
+        for (const chunk of [1, 7, 32]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < input.length; i += chunk) out += f.push(input.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, "", name + ` chunk=${chunk}: streaming must strip atomically`);
+            assert.ok(f.stats().dropped, name + " must be accounted as dropped");
+        }
+    }
+    const msg = readFileSync(new URL("cache-message.txt", NEWSHAPES_DIR), "utf8");
+    const wtMsg = stripAcpTags(msg);
+    assert.equal(wtMsg, "Cache ledger: 6,672,281 tokens read / 55,971,908 t", "whole-text keeps the payload after a lone open");
+    assert.ok(!wtMsg.includes(LT));
+    const f = createTagEchoFilter();
+    let out = "";
+    for (let i = 0; i < msg.length; i += 7) out += f.push(msg.slice(i, i + 7));
+    out += f.flush();
+    assert.ok(!out.includes(LT), "no markup may leak in streaming");
+});
+
+test("#2348 v4: hard-cut close at EOF (</ap missing >) is dropped with its ref in both modes", () => {
+    const open = `${OPEN}tokens="5" type="text"\x3e`;
+    const cases: Array<[string, string]> = [
+        [`${open}m00992${LT}/ap`, ""],
+        [`前文 ${open}m00992${LT}/ap`, "前文 "],
+        [`${open}m00992${LT}/apicdefghijklmnopqrstuvwxyz`, ""],
+    ];
+    for (const [input, expected] of cases) {
+        assert.equal(stripAcpTags(input), expected, "whole-text: " + JSON.stringify(input));
+        for (const chunk of [1, 5, 16]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < input.length; i += chunk) out += f.push(input.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, expected, `streaming chunk=${chunk}: ` + JSON.stringify(input));
+        }
+    }
+    // controls: mid-text occurrences stay visible ($ anchor), complete closes
+    // ride DEGEN_PAIR, and names over 32 chars are left alone.
+    assert.equal(stripAcpTags(`x m00992${LT}/ap more`), `x m00992${LT}/ap more`);
+    assert.equal(stripAcpTags(`${open}m00991${LT}/apc\x3e`), "");
+    assert.equal(stripAcpTags(`${open}m00993${LT}/abcdefghijklmnopqrstuvwxyzabcdefg`), `m00993${LT}/abcdefghijklmnopqrstuvwxyzabcdefg`, "33-char name exceeds the cap and stays visible");
+});
+
+// #2348 pain point 1 (owner): ordinary turns carry 1-N canonical tags — that
+// is 100% of real traffic (avg 49.7/file), not an edge case. The expanded
+// matcher surface (SELF_CLOSE, widened close classes, TRUNC_REF_CLOSE) must
+// leave such turns byte-for-byte intact in BOTH modes.
+test("#2348 v4: ordinary tag-laden turns are byte-stable through both modes", () => {
+    for (const n of [1, 8, 49, 80]) {
+        let turn = "";
+        let expected = "";
+        for (let i = 1; i <= n; i++) {
+            const tok = i % 7 === 0 ? "1.2K" : String((i * 37) % 900);
+            turn += `第${i}段正文，结论先行。` + `${OPEN}tokens="${tok}" type="text"\x3em${String(i).padStart(4, "0")}${CLOSE}`;
+            expected += `第${i}段正文，结论先行。`;
+        }
+        turn += "收尾句。";
+        expected += "收尾句。";
+        assert.equal(stripAcpTags(turn), expected, `n=${n}: whole-text must be byte-exact`);
+        for (const chunk of [1, 7, 32, 512]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < turn.length; i += chunk) out += f.push(turn.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, expected, `n=${n} chunk=${chunk}: streaming must be byte-exact`);
+        }
+    }
 });

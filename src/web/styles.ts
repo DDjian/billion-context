@@ -1,5 +1,10 @@
 export const WEB_STYLES = String.raw`
 :root {
+    /* #2473: bind the document canvas to the SAME signal that drives the
+       palette (prefers-color-scheme). Without this the canvas stays white no
+       matter the scheme, so the embed face (--bg: transparent) painted its
+       light-scheme text on a white ground in dark mode → unreadable stats. */
+    color-scheme: light dark;
     --bg: #ffffff;
     --bg-elev: #f6f8fa;
     --bg-muted: #f0f2f5;
@@ -250,6 +255,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
     .fork-link { display: none; }
     .nav { order: 3; flex: 1 1 100%; min-width: 0; }
     table.data th:nth-child(n + 6), table.data td:nth-child(n + 6) { display: none; }
+    /* hiding TDs frees nothing under table-layout: fixed — the <col> tracks of
+       the hidden columns still claim their px, so the SESSION column (the only
+       auto track) collapses to a sliver and its nowrap title overflows onto the
+       adjacent cells (double-exposed rows). Zero the hidden tracks so the freed
+       space lands on the title column again. */
+    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
     main { padding: 12px; }
     .kv { grid-template-columns: 1fr; row-gap: 3px; }
     .kv .k { margin-top: 6px; }
@@ -336,16 +347,45 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 /* Log view rows (filtered mode): actual hits vs context / time-window lines. */
 .lm-ctx { opacity: 0.55; }
 .lm-hit { background: rgba(94, 164, 255, 0.14); border-radius: 3px; }
-.summary-settings { margin: 20px 0; padding: 18px 0; border-top: 1px solid var(--border); }
-.summary-settings h2 { font-size: 18px; margin: 0 0 14px; }
+#summary-settings { margin-top: 16px; }
 .summary-target { min-width: 0; margin: 14px 0; padding: 12px; border: 1px solid var(--border); border-radius: 4px; }
 .summary-target legend { max-width: 100%; overflow-wrap: anywhere; font-size: 13px; }
 .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin-bottom: 12px; }
 .summary-grid label { display: grid; gap: 5px; min-width: 0; font-size: 12px; }
-.summary-settings .field-input { width: 100%; min-width: 0; box-sizing: border-box; }
+#summary-settings .field-input { width: 100%; min-width: 0; box-sizing: border-box; }
 .summary-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
 .summary-creds { margin: 14px 0; }
 .summary-creds h4 { margin: 0 0 8px; font-size: 13px; }
 .summary-actions label:has(input[type="password"]) { display: grid; gap: 5px; flex: 1 1 200px; min-width: 0; font-size: 12px; }
 .summary-actions .btn { min-height: 32px; }
+
+/* #2321: embeddable face (?embed=1) — framed inside a host settings page
+   (dsh). The host draws its own chrome and tab bar, so ours hides; tokens
+   flatten toward dsh-like values: transparent ground, translucent gray
+   borders, no shadow, 8px radius. Text colors keep following the scheme. */
+.embed .topbar { display: none; }
+.embed {
+    --shadow: none;
+    --radius: 8px;
+    --bg: transparent;
+    --bg-elev: rgba(127, 127, 127, 0.05);
+    --bg-muted: rgba(127, 127, 127, 0.09);
+    --border: rgba(127, 127, 127, 0.4);
+    --border-soft: rgba(127, 127, 127, 0.22);
+}
+/* #2448: the embed face lives in a NARROW host panel (a dsh settings
+   column), never a full browser tab — reuse the phone-compact column set
+   (cols 6+ hidden, same as the ≤720px rule) at ANY width and drop the
+   standalone-page min-widths so the tables fit the panel instead of
+   scrolling sideways. */
+.embed .tproc table.data { min-width: 0; }
+.embed .twide table.data { min-width: 0; }
+.embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }
+/* same fixed-layout trap as the ≤720px rule above — the hidden
+   columns' <col> tracks must release their widths or the title column
+   collapses and rows render double-exposed. */
+.embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+.embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
+.embed main { max-width: none; padding: 4px 0 12px; }
+.embed .banner { margin: 8px 0 0; }
 `;

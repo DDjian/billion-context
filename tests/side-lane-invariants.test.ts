@@ -264,3 +264,42 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
         assert.doesNotMatch(mod(f), laneInternals, `${f} must stay decoupled from the side-lane engine`);
     }
 });
+
+// (#1440 P2 cut 3): the extracted pipeline module OWNS the mid-pipeline lane
+// gates, so it legitimately imports side-request.js — unlike (F)'s modules.
+// What must not move or appear: the engine's internals (threshold constants,
+// signal shapes, decision types, output-budget plumbing). restoreOutputBudget
+// and sideRequestGuard are allowlisted because their call sites already lived
+// in handle() before the extraction (moved, not newly coupled).
+test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
+    const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
+    const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
+    assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    let sawImport = false;
+    for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
+        sawImport = true;
+        for (const raw of m[1].split(",")) {
+            const name = raw.trim().replace(/^type\s+/, "");
+            if (!name) continue;
+            assert.ok(allowlist.has(name), `handle.ts imports ${name} from side-request.js (out-of-allowlist lane symbol)`);
+        }
+    }
+    assert.ok(sawImport, "handle.ts is expected to import its lane gates from side-request.js (the boundary under test)");
+});
+
+// (#1440 P2 cut 4): the extracted relay module (forward) is the wire tail — it
+// consumes already-made lane DECISIONS through the Prepared it receives and
+// must not touch the side-lane engine at all: no direct import, no gate
+// symbols. `prepared.sidePassthrough` field reads and "side requests" prose
+// are deliberately ALLOWED (not in the regexes) — they are pre-made decision
+// reads / comments that moved verbatim, not new coupling.
+test("(H) extracted relay module keeps the side-lane boundary (#1440 P2 cut 4)", () => {
+    const text = readFileSync(fileURLToPath(new URL("../src/server/relay.ts", import.meta.url)), "utf8");
+    assert.doesNotMatch(text, /\bfrom\s*["'](?:\.\.?\/)*side-request\.js["']/, "relay.ts must not import the side-lane engine directly");
+    assert.doesNotMatch(
+        text,
+        /\b(resolveSideLane|demoteGate|SideLaneDecision|demotedSide|sideRequestLike|SIDE_REQUEST_MAX_TOKENS|isSideRequest|stripLeakedBiliTools|hasLeakedBiliToolsOnly|restoreOutputBudget|sideRequestGuard)\b/,
+        "relay.ts must stay decoupled from the side-lane engine symbols",
+    );
+});

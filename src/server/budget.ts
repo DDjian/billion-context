@@ -21,13 +21,46 @@ const OUTPUT_CLAMP_FLOOR = 1024;
 // host-side: renderNudgeText does not depend on shouldInject.
 const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
 
+/** #2391: a budget view only; never forward this projection. OpenAI tool search
+ * defers individual function schemas, while namespace descriptions stay visible.
+ * https://developers.openai.com/api/docs/guides/tools-tool-search */
+export function modelVisibleTools(tools: unknown): unknown {
+    if (!Array.isArray(tools) || !tools.some((t) => t?.type === "tool_search")) return tools ?? [];
+    const project = (tool: unknown): unknown => {
+        if (!tool || typeof tool !== "object") return tool;
+        const item = tool as Record<string, unknown>;
+        if (item.type === "namespace" && Array.isArray(item.tools)) {
+            return { ...item, tools: item.tools.map(project) };
+        }
+        if (item.type === "function" && typeof item.name === "string"
+            && item.parameters && typeof item.parameters === "object"
+            && !Array.isArray(item.parameters) && item.defer_loading === true) {
+            return { type: item.type, name: item.name, defer_loading: true };
+        }
+        return tool;
+    };
+    return tools.map(project);
+}
+
+/** Loaded definitions count in full even if they still carry defer_loading. */
+export function countLoadedToolTokens(body: Record<string, unknown>): number {
+    if (!Array.isArray(body.input)) return 0;
+    let tokens = 0;
+    for (const item of body.input) {
+        if (["additional_tools", "tool_search_call", "tool_search_output", "mcp_list_tools"].includes(item?.type)) {
+            tokens += defaultCountTokens(JSON.stringify(item));
+        }
+    }
+    return tokens;
+}
+
 /** chars/4 measure of the per-request overhead that lives OUTSIDE the kernel's
  *  fold space: the outbound system prompt (client text plus bili-injected parts)
  *  and the tool schemas. The kernel's contextBreakdown classifies messages only,
  *  so this is what the status panel's SysPrompt row must add back (#532). Same
  *  counting method as estimateInputTokens below. */
 export function countSystemAndToolsTokens(systemText: string | undefined, tools: unknown): number {
-    return defaultCountTokens(systemText ?? "") + defaultCountTokens(JSON.stringify(tools ?? []));
+    return defaultCountTokens(systemText ?? "") + defaultCountTokens(JSON.stringify(modelVisibleTools(tools)));
 }
 
 /** Conservative outbound-input estimate: the larger of the upstream-reported
@@ -44,8 +77,8 @@ export function countSystemAndToolsTokens(systemText: string | undefined, tools:
  *  raw chars/4 est ~137K vs provider-billed ~81K) used to win the max() raw
  *  and starve the output clamp (32768 -> 3357 with ample actual headroom).
  *  The usage-grade baseline is already provider-measured and is NEVER scaled. */
-export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string, kFactor?: number, kOrigin?: string, origin?: string): number {
-    const est = applyEstimateCalibration(estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools), kFactor, kOrigin, origin);
+export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string, kFactor?: number, kOrigin?: string, origin?: string, loadedToolTokens = 0): number {
+    const est = applyEstimateCalibration(estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools) + loadedToolTokens, kFactor, kOrigin, origin);
     const baseline = lastInputTokens > 0 && lastInputTokensSource === "usage" ? lastInputTokens : 0;
     return Math.max(baseline, est);
 }
@@ -184,7 +217,9 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
             .join("\n");
         if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
     }
-    return defaultCountTokens(sysText) + defaultCountTokens(JSON.stringify(parsed.tools ?? []));
+    return defaultCountTokens(sysText)
+        + defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
+        + (protocol === "responses" ? countLoadedToolTokens(parsed) : 0);
 }
 
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or
@@ -246,7 +281,8 @@ export function clampOutgoingOutput(
     if (typeof raw !== "number") return;
     // #488: images ride along in the rebuilt body but are invisible to the text model —
     // without them the cap is too generous and input+output can still overflow.
-    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin) + ctx.imageTokens;
+    const loadedToolTokens = field === "max_output_tokens" ? countLoadedToolTokens(rebuilt) : 0;
+    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin, loadedToolTokens) + ctx.imageTokens;
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);

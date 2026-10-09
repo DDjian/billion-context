@@ -89,6 +89,36 @@ self-compression (codex `/compact`, claude-code `/compact`).
 
 Axioms should be chosen by their cheaper failure mode.
 
+## Hosts must keep tool-call ids byte-stable within a conversation
+
+The hash includes `toolCallId` as a factor, and the fold-reconcile layer
+(`src/fold-reconcile.ts`, #1921) uses it as its primary claim key:
+`tool_use.id` / `tool_call_id` are the only fields that are both
+protocol-unique per conversation and survive client re-serialization
+verbatim. That premise has one external dependency — the **host itself**
+must not rewrite those ids when projecting one conversation onto another
+provider. #2396 found a real violation: Prime (pi-family runtime) switched
+one conversation from Codex to a custom Responses provider, and its
+foreign-provider converter re-sanitized the stored composite ids —
+`call_switch_seed|fc_0_0` serialized as `call_switch_seed` on the Codex
+lane but went out as `call_switch_seed_fc_0_0` on the foreign lane, on both
+sides of every pair. Both claim passes key on the id, so every folded tool
+pair stopped matching: context billed at ~66,525 input tokens re-entered at
+558,541/562,549 against a 500,000-token window.
+
+Bili's response follows the failure-mode axiom above: it does NOT guess
+old→new pairings (that would convert non-recognition into misattribution —
+decompress returning wrong content under a plausible-looking id swap). It
+detects the shape instead: a missing covered id whose normalized identity
+WITHOUT the toolCallId matches an inbound twin carrying a different
+toolCallId is counted as a rewrite suspect and named in the drift log
+(#2396), while the originals honestly re-enter the wire unfolded. The
+obligation belongs to hosts — see PLUGIN.md ("Obligations of a plugin",
+item 5): canonicalize ids at the host boundary before the payload reaches
+the proxy. The #2396 workaround (rewrite `call_id` + `call_output.call_id`
+together from the authoritative stored history before proxy processing) is
+the reference implementation of that duty.
+
 ## Known cost of the hash axiom — and how it was fixed
 
 Same bytes ⇒ same identity has a cost face: #1476 — a user re-sends a short
@@ -152,6 +182,7 @@ byte-identical. Identity bookkeeping is never involved.
 | Near-match tolerance on content | Byte-exactness is load-bearing (same argument as `SESSION-IDENTITY.md`); fuzzy joins misattribute silently on decompress. |
 | Promote `msg-proxy-*` to identity | Single lane, response-side coverage only, amplification-prone channel (tag-echo evidence), upstream namespace constraints. |
 | Marker-as-identity (tags persisted by hosts) | The tag-echo incidents show the channel corrupts what it carries; current design already strips it at both ends. |
+| Implicit aliasing of host-rewritten tool-call ids | Pairing a missing covered id with an inbound twin that has identical content under a different toolCallId requires host knowledge; without it the claim is a guess and misattributes on decompress (#2396: Prime rewrote composite ids across a provider switch). Detection-only shipped; the fix belongs at the host boundary (PLUGIN.md obligation 5). |
 
 ## Future direction
 
@@ -163,4 +194,4 @@ join, mNNNNN is the ledger, tags are the view.
 Related: #1496 (this document's prompt), `SESSION-IDENTITY.md` (session
 granularity), #1476 + kernel #459/#463 (echo discrimination), #242/#1475
 (Responses id constraints), #206/#673 (tag echo), #1479/#1482 (strict-echo
-repair), #1039 (tool-call byte-exactness invariant).
+repair), #1039 (tool-call byte-exactness invariant), #2396 (host-rewritten tool-call ids across a provider switch).

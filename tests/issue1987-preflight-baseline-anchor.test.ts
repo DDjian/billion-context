@@ -109,11 +109,13 @@ test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not th
         assert.equal(r1.status, 200);
         await r1.text();
 
-        // Twenty bash tool pairs (~300k tokens untruncated): preflight folds oldest-first
-        // but its 16-call summary budget runs out far short of the list, so the kernel's
-        // no-emergency-truncate view still carries a huge unfolded tail while the rebuilt
-        // payload ships much less. The old anchor measured the untruncated view; the new
-        // one measures what ships (or the netted meter, whichever is larger).
+        // Twenty bash tool pairs (~300k tokens untruncated) against a 10k window is a ~30x
+        // overshoot — past EMERGENCY_FOLD_COVERAGE (19.2x, #2383). Preflight therefore folds
+        // every range with a CPU-only deterministic digest (zero summarization calls) and
+        // CONVERGES in one invocation instead of exhausting the LLM budget and refusing.
+        // The #1987 invariant this test pins is orthogonal to that mechanism: the post-fold
+        // usage baseline must anchor to the payload that ACTUALLY ships (here, the small
+        // digested rebuild), never to the kernel's no-emergency-truncate view (~300k).
         const pairs: Array<{ role: string; content: unknown }> = [];
         for (let i = 0; i < 20; i++) {
             pairs.push({ role: "assistant", content: [{ type: "tool_use", id: `call_${i}`, name: "bash", input: { command: `step ${i}` } }] });
@@ -125,23 +127,24 @@ test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not th
             headers,
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: pairs }),
         });
-        // The rebuilt payload still exceeds the 10k window (only the meter-sized truncate
-        // budget was spent), so the turn is refused — exactly the user's 502 path. The
-        // regression is in the BASELINE left behind, not in the status.
-        assert.equal(r2.status, 502, "the over-window turn is refused after preflight");
+        // Beyond the coverage bound the payload CONVERGES via deterministic digest (#2383):
+        // the turn succeeds and BOTH turns reach the upstream. The 502 budget-exhaustion
+        // fail-fast this scenario used to exercise is covered by preflight-fail-fast /
+        // preflight-round-budget; here we pin the converged end-state + the baseline anchor.
+        assert.equal(r2.status, 200, "a beyond-coverage-bound payload converges via deterministic digest (#2383)");
         await r2.text();
 
-        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight made the summarization call(s)");
-        assert.equal(calls.filter((c) => c.stream).length, 1, "only turn 1 reached the upstream");
+        assert.equal(calls.filter((c) => !c.stream).length, 0, "#2383 emergency regime makes ZERO summarization calls");
+        assert.equal(calls.filter((c) => c.stream).length, 2, "both turns reach the upstream once the payload converges");
 
         const s = getSession("issue1987-anchor-sess");
         assert.ok(s, "session exists");
-        // Netted meter ≈ 240k − folded mass (~80k) ≈ 160k; the OLD preflight-side anchor
-        // would have raised it to the untruncated kernel view (~220k) instead. The gap is
-        // invariant to fold volume (it equals raw−baseline minus summary costs), so the
-        // bound sits between the two regimes with margin on both sides.
-        assert.ok(s.stats.lastInputTokens < 190_000, `baseline stays at netted/shipped scale, got ${s.stats.lastInputTokens}`);
-        assert.equal(s.stats.lastInputTokensSource, "usage");
+        // The shipped payload is the small digested rebuild (fits the 10k window), far below
+        // the untruncated kernel view (~300k) AND below the old netted-meter regime (~160k):
+        // anchoring anywhere near the untruncated view is exactly the #1987 defect, so the
+        // bound sits well clear of it with margin on both sides.
+        assert.ok(s.stats.lastInputTokens < 60_000, `baseline anchors to the shipped digested payload, not the untruncated view; got ${s.stats.lastInputTokens}`);
+        assert.equal(s.stats.lastInputTokensSource, "estimate", "no usage report lands on the converged turn, so the estimate of the shipped payload wins");
     } finally {
         proxy.close();
         await once(proxy, "close");

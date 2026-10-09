@@ -67,6 +67,15 @@ test("WC-012 validates compaction IDs without changing function-call ID rules", 
     assert.match(VALIDATORS.responses({ input: [{ type: "compaction", id: "fc_bili_local" }] })[0], /WC-012/);
 });
 
+test("WC-015 validates message-item IDs without constraining provider namespaces", () => {
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "msg_real", content: "x" }] }), []);
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "msg-proxy-1750000000000-0", content: "x" }] }), []);
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "message", role: "user", content: "no id" }] }), []);
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "reasoning", id: "rs_1" }] }), []);
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "function_call", id: "fc_1", call_id: "c1", name: "f", arguments: "{}" }] }), []);
+    assert.match(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "x" }] })[0], /WC-015/);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -116,6 +125,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
         ],
         responses: [
             { type: "response.create", input: [], stream: true },
+            { input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "marker" }] },
             { input: [{ type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary" }] },
             { tools: [{ type: "function", name: "bad name", parameters: { type: "object", properties: {} } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "array" } }] },

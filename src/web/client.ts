@@ -5,9 +5,21 @@ export const WEB_CLIENT = `(function () {
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
-        const saved = localStorage.getItem("bili-language");
-        if (saved === "en" || saved === "zh-CN") locale = saved;
-        else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        // #2321: an embedding host may pin the locale explicitly (?lang=zh|en) —
+        // it outranks both the stored choice and the browser default so the
+        // framed UI follows the host's language. Regex parse + typeof guard on
+        // purpose: this IIFE also executes in vm sandboxes without URLSearchParams
+        // and in host contexts with no location global at all (test harnesses).
+        const search = typeof location !== "undefined" ? location.search || "" : "";
+        const pinMatch = /[?&]lang=([^&]*)/i.exec(search);
+        const pinned = pinMatch && pinMatch[1] ? pinMatch[1] : null;
+        if (pinned === "zh" || pinned === "zh-CN") locale = "zh-CN";
+        else if (pinned === "en") locale = "en";
+        else {
+            const saved = localStorage.getItem("bili-language");
+            if (saved === "en" || saved === "zh-CN") locale = saved;
+            else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        }
     } catch (e) {}
     function t(key, vars) {
         let text = MESSAGES[locale][key];
@@ -59,8 +71,9 @@ export const WEB_CLIENT = `(function () {
             else hidden += 1;
         }
         let line = c.events + " event(s) in " + c.sessions + " session(s)" + (kinds ? ": " + kinds : "");
+        // #2324: the split is record RECENCY, not liveness — "active" read as a running conflict.
         if (typeof c.active === "number" && typeof c.historical === "number") {
-            line += " · " + c.active + " active · " + c.historical + " historical";
+            line += " · " + t("conflict.age_active", { n: c.active }) + " · " + t("conflict.age_historical", { n: c.historical });
         }
         if (shown.length > 0) {
             line += " — " + shown.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
@@ -68,7 +81,47 @@ export const WEB_CLIENT = `(function () {
         if (hidden > 0) line += " · …+" + hidden + " more (GET /__bili/stats → conflicts)";
         return line;
     }
+    // #2324: pick the banner title/risk wording from the ledger families present. Name-only
+    // [suspected] matches are NEVER treated as confirmed compressors — they get a softer
+    // "verify first" framing, not the imperative double-compression warning. Old payloads
+    // without c.suspected degrade to the previous all-confirmed view. Pure (reads only c),
+    // exported for tests the same way bili_conflictLine is.
+    function bili_conflictSeverity(c) {
+        const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
+        const siblingN = Math.max(0, Math.min(typeof c.sibling === "number" ? c.sibling : 0, pluginN));
+        const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN));
+        const confirmedTpN = Math.max(0, pluginN - siblingN - suspectedN);
+        const nativeN = Math.max(0, c.events - pluginN);
+        const whatParts = [];
+        if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
+        if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
+        // #2430: siblings are family, never a warning — they no longer appear in the
+        // "what" enumeration even in mixed ledgers (pure-sibling banners are hidden outright).
+        if (nativeN > 0) whatParts.push(t("conflict.what_native"));
+        const active = typeof c.active === "number" ? c.active : c.events;
+        const hasConfirmed = confirmedTpN > 0 || nativeN > 0;
+        // Resolve each branch through a direct translate call (not a key-to-text lookup table)
+        // so the #1024 static ref-scanner still counts every conflict.* key used here; surface
+        // both the key (locale-independent, asserted by tests) and the rendered text.
+        let onKey, riskKey, onText, riskText;
+        if (hasConfirmed) {
+            onKey = "conflict.on"; onText = t("conflict.on");
+            if (active > 0) { riskKey = "conflict.risk_active"; riskText = t("conflict.risk_active"); }
+            else { riskKey = "conflict.risk_historical"; riskText = t("conflict.risk_historical"); }
+        } else if (suspectedN > 0) {
+            onKey = "conflict.on_suspected"; onText = t("conflict.on_suspected");
+            riskKey = "conflict.risk_suspected"; riskText = t("conflict.risk_suspected");
+        } else {
+            onKey = "conflict.on"; onText = t("conflict.on");
+            riskKey = "conflict.risk_sibling"; riskText = t("conflict.risk_sibling");
+        }
+        // #2430: a ledger that is ONLY bili's own siblings stands down completely — they are
+        // compatible family, not conflicts; the web banner must stay hidden for them.
+        const siblingOnly = !hasConfirmed && suspectedN === 0 && siblingN > 0;
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, what: whatParts.join(t("conflict.what_join")), active: active };
+    }
     window.bili_conflictLine = bili_conflictLine;
+    window.bili_conflictSeverity = bili_conflictSeverity;
     // #2219: per-client remediation block for the conflict surfaces — one
     // actionable i18n line per resolved client (capped so the banner stays a
     // summary), unknown clients fall back to the generic hint, and every block
@@ -106,6 +159,21 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_conflictHintBlock = conflictHintBlock;
+    // #2462: high-cost plugin notice (NOT a compression conflict). Pure builder
+    // taking pre-translated strings so the test seam needs only escapeHtml;
+    // name/url are user/plugin data -> escaped.
+    function bili_pluginAdvisoryBanner(advs, s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        for (const a of advs) {
+            const url = typeof a.issueUrl === "string" ? a.issueUrl : "";
+            html += '<div class="alert-row"><span><strong>' + escapeHtml(a.name || a.id) + "</strong> " + escapeHtml(s.desc) + "</span>";
+            if (url) html += '<a class="mono" href="' + escapeHtml(url) + '" target="_blank" rel="noopener">' + escapeHtml(url) + "</a>";
+            html += "</div>";
+        }
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_pluginAdvisoryBanner = bili_pluginAdvisoryBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -151,7 +219,8 @@ export const WEB_CLIENT = `(function () {
         if (n === null || n === undefined || isNaN(n)) return t("common.none");
         n = Math.round(Number(n));
         const abs = Math.abs(n);
-        if (abs >= 1e9) return (n / 1e9).toFixed(1) + "B";
+        // #2413: B-tier was toFixed(1) → 100M step, cumulative counters looked frozen for days; toFixed(2) = 10M keeps growth visible.
+        if (abs >= 1e9) return (n / 1e9).toFixed(2) + "B";
         if (abs >= 1e6) return (n / 1e6).toFixed(1) + "M";
         if (abs >= 1e4) return Math.round(n / 1e3) + "K";
         if (abs >= 1e3) return (n / 1e3).toFixed(1) + "K";
@@ -251,7 +320,7 @@ export const WEB_CLIENT = `(function () {
     function refreshDirtyFlag() {
         const el = $("cfg-file-edit");
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
-        ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
+        ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
     }
 
@@ -349,9 +418,13 @@ export const WEB_CLIENT = `(function () {
             $("st-sessions").textContent = String(total);
             $("st-sessions-sub").textContent = liveN + " " + t("ov.live_now") + " · " + Math.max(0, total - liveN) + " " + t("ov.hist");
             $("st-reqs").textContent = o.requests ? fmtW(o.requests) : t("common.none");
-            $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            const grossEl = $("st-gross");
+            grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
-            $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            const netEl = $("st-netsaved");
+            netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             const hs = $("st-hit-split");
@@ -415,7 +488,11 @@ export const WEB_CLIENT = `(function () {
         const cb = $("conflicts-banner");
         if (cb) {
             const c = d.conflicts;
-            if (c && c.events > 0) {
+            // #2430: siblings-only ledgers stand down — bili's own family (billion-context-pi /
+            // opencode-acp) is compatible, so a pure-sibling ledger is not a warning. The events
+            // stay recorded (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
+            if (c && c.events > 0 && !(sev0 && sev0.siblingOnly)) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
@@ -424,19 +501,13 @@ export const WEB_CLIENT = `(function () {
                 // #2261: bili's own siblings (billion-context-pi / opencode-acp) are NOT
                 // third-party plugins — the server counts them separately so the sentence
                 // never mislabels them or commands removal of something that stands down.
-                const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
-                const siblingN = Math.max(0, Math.min(typeof c.sibling === "number" ? c.sibling : 0, pluginN));
-                const tpN = pluginN - siblingN;
-                const nativeN = c.events - pluginN;
-                const what = [tpN > 0 ? t("conflict.what_plugin") : "", siblingN > 0 ? t("conflict.what_sibling") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
-                const active = typeof c.active === "number" ? c.active : c.events;
-                const risk = tpN === 0 && nativeN === 0 ? t("conflict.risk_sibling") : (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical"));
+                const sev = bili_conflictSeverity(c);
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
-                cb.classList.toggle("info", active === 0);
-                cb.classList.toggle("warn", active > 0);
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.classList.toggle("info", !(sev.hasConfirmed && sev.active > 0));
+                cb.classList.toggle("warn", sev.hasConfirmed && sev.active > 0);
                 const btn = $("conflicts-clear-btn");
                 if (btn) {
                     btn.addEventListener("click", async () => {
@@ -473,6 +544,19 @@ export const WEB_CLIENT = `(function () {
                 ab.hidden = true;
                 ab.classList.remove("show");
                 ab.innerHTML = "";
+            }
+        }
+        const pb = $("plugin-advisory-banner");
+        if (pb) {
+            const advs = Array.isArray(d.pluginAdvisories) ? d.pluginAdvisories : [];
+            if (advs.length > 0) {
+                pb.hidden = false;
+                pb.classList.add("show");
+                pb.innerHTML = bili_pluginAdvisoryBanner(advs, { on: t("pluginadv.on"), desc: t("pluginadv.desc"), hint: t("pluginadv.hint") });
+            } else {
+                pb.hidden = true;
+                pb.classList.remove("show");
+                pb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -1578,6 +1662,7 @@ export const WEB_CLIENT = `(function () {
             updatePackNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
+            refreshTierInputs();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
@@ -1709,6 +1794,7 @@ export const WEB_CLIENT = `(function () {
                 const v = parseInt(nudge.value, 10);
                 if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) d.compress.nudgeGrowthTokens = v; else delete d.compress.nudgeGrowthTokens;
             });
+            refreshTierInputs();
         }
         function nudgeBtn(label, delta) {
             const b = document.createElement("button");
@@ -1738,6 +1824,85 @@ export const WEB_CLIENT = `(function () {
         nwrap.appendChild(nnote);
         box.appendChild(nwrap);
         nudge.addEventListener("change", syncNudge);
+        function tierDerivedOf(cp) {
+            const base = (cp && typeof cp.nudgeGrowthTokens === "number") ? cp.nudgeGrowthTokens : NUDGE_DEFAULT;
+            const m = Math.round(base * 1.5);
+            return { t1: base, t2: m, t3: m };
+        }
+        function refreshTierInputs() {
+            const cp = compressOf(draft);
+            const tt = (cp && cp.tierNudgeTokens && typeof cp.tierNudgeTokens === "object" && !Array.isArray(cp.tierNudgeTokens)) ? cp.tierNudgeTokens : null;
+            const dv = tierDerivedOf(cp);
+            ["t1", "t2", "t3"].forEach((k) => { tierInps[k].value = String((tt && typeof tt[k] === "number") ? tt[k] : dv[k]); });
+        }
+        const tierInps = {};
+        ["t1", "t2", "t3"].forEach((k) => {
+            const inp = document.createElement("input");
+            inp.type = "number";
+            inp.id = "quick-tiers-" + k;
+            inp.className = "field-input mono";
+            inp.style.width = "84px";
+            inp.min = "1";
+            inp.step = String(NUDGE_STEP);
+            inp.spellcheck = false;
+            inp.placeholder = t("cfg.q_tiers_auto");
+            qCtrls.push(inp);
+            tierInps[k] = inp;
+        });
+        tierInps.t1.title = t("cfg.q_tiers_tip_t1");
+        tierInps.t2.title = t("cfg.q_tiers_tip_t2");
+        tierInps.t3.title = t("cfg.q_tiers_tip_t3");
+        function syncTiers() {
+            commit((d) => {
+                if (!compressOf(d)) d.compress = {};
+                const dv = tierDerivedOf(compressOf(d));
+                const next = {};
+                ["t1", "t2", "t3"].forEach((k) => {
+                    const v = parseInt(tierInps[k].value, 10);
+                    if (isNaN(v) || v < 1) { tierInps[k].value = String(dv[k]); return; }
+                    if (v !== dv[k]) next[k] = v;
+                });
+                if (Object.keys(next).length === 0) delete d.compress.tierNudgeTokens; else d.compress.tierNudgeTokens = next;
+            });
+        }
+        function tierBtn(k, delta) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn sm";
+            b.textContent = delta > 0 ? "+" : "\u2212";
+            b.title = t("cfg.q_tiers_step");
+            b.addEventListener("click", () => { const cur = parseInt(tierInps[k].value, 10); const base = isNaN(cur) ? tierDerivedOf(compressOf(draft))[k] : cur; tierInps[k].value = String(Math.max(1, base + delta)); syncTiers(); });
+            return b;
+        }
+        const trow = document.createElement("div");
+        trow.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const tlab = document.createElement("label");
+        tlab.htmlFor = "quick-tiers-t1";
+        tlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        tlab.textContent = t("cfg.q_tiers");
+        const tg = document.createElement("div");
+        tg.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap";
+        ["t1", "t2", "t3"].forEach((k, i) => {
+            if (i > 0) tg.appendChild(document.createTextNode("/"));
+            const tag = document.createElement("span");
+            tag.style.cssText = "font-size:12px;color:#57606a";
+            tag.textContent = k.toUpperCase();
+            tg.appendChild(tag);
+            tg.appendChild(tierBtn(k, -NUDGE_STEP));
+            tg.appendChild(tierInps[k]);
+            tg.appendChild(tierBtn(k, NUDGE_STEP));
+        });
+        trow.appendChild(tlab);
+        trow.appendChild(tg);
+        const twrap = document.createElement("div");
+        twrap.style.cssText = "display:flex;flex-direction:column;gap:4px";
+        twrap.appendChild(trow);
+        const tnote = document.createElement("div");
+        tnote.style.cssText = "font-size:12px;color:#57606a";
+        tnote.textContent = t("cfg.q_tiers_desc");
+        twrap.appendChild(tnote);
+        box.appendChild(twrap);
+        ["t1", "t2", "t3"].forEach((k) => tierInps[k].addEventListener("change", syncTiers));
         const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
         qCtrls.push(ptInp);
         const ptWarn = document.createElement("div");
@@ -2027,7 +2192,14 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.addEventListener("click", () => {
             locale = locale === "zh-CN" ? "en" : "zh-CN";
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
-            location.reload();
+            // #2321: a ?lang= pin would silently re-force the old language on a
+            // plain reload — drop it so the manual choice sticks.
+            if (/[?&]lang=[^&]*/i.test(location.search)) {
+                const qs = location.search.slice(1).replace(/(?:^|&)lang=[^&]*/i, "").replace(/^[?&]+|[?&]+$/g, "");
+                location.href = location.pathname + (qs ? "?" + qs : "") + location.hash;
+            } else {
+                location.reload();
+            }
         });
         // #1937: search is server-side (?q=) — debounced re-query, not a local filter.
         const search = $("ses-search");

@@ -344,7 +344,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
     input: ApplyCompressionInput,
   ): ApplyCompressionResult {
     const state: CompressionState = cloneState(input.state);
-    const runId = allocateRunId(state);
+    // Lazy run-id allocation (#2370): never advance nextRunId on a no-op
+    // failure — the host forkSnapshot fingerprint hashes full state, so a bump
+    // here would churn contextGeneration on every failed manual tool.
+    let allocatedRunId: string | null = null;
+    const runIdOf = (): string => (allocatedRunId ??= allocateRunId(state));
     let blocksCreated = 0;
     let tokensCompressed = 0;
     const errors: string[] = [];
@@ -410,6 +414,37 @@ export function createCore(ports: Ports = {}): CompressionCore {
           );
         }
       }
+    }
+
+    // #2362: dead-ref tracking. A requested endpoint whose ref is known to
+    // this session but backs no visible or folded message is unreachable —
+    // the client rewrote or dropped that message. Record it so every later
+    // receipt and acp_status says DEAD instead of inviting another doomed
+    // retry (the self-amplifying failure loop). Tombstone-with-clear: refs
+    // are never removed from byRef (Kernel Contract), and a tombstone lifts
+    // once its message reappears in the view.
+    const visibleIdsForDead = new Set(input.messages.map((m) => m.id));
+    let deadRefs: string[] = (state.deadRefs ?? []).filter((ref) => {
+      const rawId = state.messageRefs.byRef[ref];
+      return !(rawId !== undefined && visibleIdsForDead.has(rawId));
+    });
+    const danglingBySpec = new Map<(typeof input.ranges)[number], string[]>();
+    for (const spec of input.ranges) {
+      const resolution = classifications.get(spec);
+      if (resolution === undefined || resolution.status !== "consumed") continue;
+      const dangling = danglingMessageRefs(state, input.messages, spec);
+      if (dangling.length === 0) continue;
+      danglingBySpec.set(spec, dangling);
+      for (const ref of dangling) {
+        if (!deadRefs.includes(ref)) deadRefs.push(ref);
+      }
+    }
+    if (deadRefs.length > 0) {
+      state.deadRefs = [...new Set(deadRefs)].sort(
+        (a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")),
+      );
+    } else {
+      state.deadRefs = undefined;
     }
 
     let resolvableCount = 0;
@@ -547,8 +582,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
             }),
           ),
         ];
-        const danglingRefs = consumedRanges.flatMap((spec) =>
-          danglingMessageRefs(state, input.messages, spec),
+        const danglingRefs = consumedRanges.flatMap(
+          (spec) => danglingBySpec.get(spec) ?? [],
         );
         let gateMessage =
           resolvableCount === 0 &&
@@ -557,7 +592,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them, so unknown refs cannot come from an earlier compress in this session. They come from a different generation: a previous session instance (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001), the generation before a native-compaction rebase (which also resets refs to m00001), or a typo. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
             : consumedRanges.length > 0
               ? danglingRefs.length > 0
-                ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — the refs exist in this session's ref map, but the messages they point to are no longer in the visible context and no active block covers them: the message content changed (or the message was filtered out of the view) and now carries a new ref, leaving your old refs dangling. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
+                ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
                 : `Requested range(s) already compressed (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — ${coverDetail}${refoldDetail}. Nothing new to compress in that window. ${diagnostics} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`
               : countedRanges > 0
                 ? `Total compressible content too small (${totalRangeChars} chars across ${countedRanges} range(s), min ${input.config.compress.minCompressRange}). Combine more messages into your range(s) to meet the threshold.${refoldSuffix(okBlockedReasons)}`
@@ -588,8 +623,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
           gateMessage += ` ${reversalNotes.join(" ")}`;
         }
 
+        // Rejected batches still carry their side effect: the dead-ref
+        // tombstones marked above (#2362). The clone differs from input.state
+        // ONLY in that field before the gate, so returning it is safe.
         return {
-          state: input.state,
+          state,
           result: {
             blocksCreated: 0,
             tokensCompressed: 0,
@@ -611,7 +649,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             applyRefolds({
               spec,
               state,
-              runId,
+              runId: runIdOf(),
               config: input.config,
               blockIds: decision.blocks.map((block) => block.blockId),
             });
@@ -627,8 +665,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
           continue;
         }
         const reasons = decision?.kind === "blocked" ? decision.reasons : [];
+        const dangling = danglingBySpec.get(spec);
         warnings.push(
-          `Skipped range (${spec.startRef}..${spec.endRef}) — already compressed${reasons.length > 0 ? `: ${reasons.join("; ")}` : " (messages consumed by existing block(s))"}; nothing to compress.`,
+          dangling && dangling.length > 0
+            ? `Skipped range (${spec.startRef}..${spec.endRef}) — its refs ${dangling.join(", ")} are DEAD (the client rewrote or dropped those messages); this range can never compress, do not retry it.`
+            : `Skipped range (${spec.startRef}..${spec.endRef}) — already compressed${reasons.length > 0 ? `: ${reasons.join("; ")}` : " (messages consumed by existing block(s))"}; nothing to compress.`,
         );
         continue;
       }
@@ -644,7 +685,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           spec,
           messages: input.messages,
           state,
-          runId,
+          runId: runIdOf(),
           config: input.config,
           protectedMessageIds,
           countTokens,
@@ -723,7 +764,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // returned state carries THIS pass's snapshot for the next one.
     const inboundIds = input.messages.map((m) => m.id);
     const result = runPipeline(nodes, initial, ctx);
-    const state = { ...result.state, lastPassIds: inboundIds };
+    // #2362: lift dead-ref tombstones whose messages came back into the resent
+    // view (tombstone-with-clear — types.CompressionState.deadRefs).
+    let deadRefs = result.state.deadRefs;
+    if (deadRefs && deadRefs.length > 0) {
+      const inboundSet = new Set(inboundIds);
+      const kept = deadRefs.filter((ref) => {
+        const rawId = result.state.messageRefs.byRef[ref];
+        return !(rawId !== undefined && inboundSet.has(rawId));
+      });
+      deadRefs = kept.length > 0 ? kept : undefined;
+    }
+    const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
     return {
       messages: result.messages,
@@ -1758,12 +1810,20 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // T1; T2/T3 override via either path: (a) COUNT — the number of active
   // lower-tier blocks reached tiers.tier2Trigger/tier3Trigger (the documented
   // block-count trigger; summaries are ~10:1 condensed so a token comparison
-  // against raw pending starves), or (b) TOKEN MASS — crossed the shared 1.5x
+  // against raw pending starves), or (b) TOKEN MASS — crossed the per-tier
   // threshold AND exceeds the effective pending of every lower tier (T2 > T1
-  // effective; T3 > T2 and > T1 effective).
+  // effective; T3 > T2 and > T1 effective). Per-tier thresholds (#2376):
+  // nudge.tierGrowthTokens.{t1,t2,t3} may pin each mass trigger independently;
+  // each unset tier keeps its derived default (T1 = growth step, T2/T3 = the
+  // shared multiplier threshold), so absent config decides byte-identically.
   const tier2Threshold = Math.round(
     nudgeGrowthTokens * (config.nudge.tier2GrowthMultiplier ?? 1.5),
   );
+  const tierThresholds: Record<CompressionTier, number> = {
+    1: config.nudge.tierGrowthTokens?.t1 ?? nudgeGrowthTokens,
+    2: config.nudge.tierGrowthTokens?.t2 ?? tier2Threshold,
+    3: config.nudge.tierGrowthTokens?.t3 ?? tier2Threshold,
+  };
   let injectedTier: CompressionTier | null = null;
   let injectedReason = "";
   let bestPending = 0;
@@ -1834,12 +1894,12 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
     }
   } else if (growthReady) {
-    if (t1Eff >= nudgeGrowthTokens) {
+    if (t1Eff >= tierThresholds[1]) {
       injectedTier = 1;
-      injectedReason = `T1 effective ${t1Eff} >= ${nudgeGrowthTokens}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
+      injectedReason = `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
     } else if (
       config.tiers.enabled &&
-      (t2CountReady || (t2Pen >= tier2Threshold && t2Pen > t1Eff))
+      (t2CountReady || (t2Pen >= tierThresholds[2] && t2Pen > t1Eff))
     ) {
       const lastShown = state.nudge.lastShownByTier[2] ?? 0;
       const cadenceMet =
@@ -1848,12 +1908,12 @@ function decideNudge(input: NudgeInput): NudgeDecision {
         injectedTier = 2;
         injectedReason = t2CountReady
           ? `T2 distill ready: ${t2Count} tier-1 blocks >= tier2Trigger ${config.tiers.tier2Trigger} (${t2Pen} tokens), usage ${Math.round(usage * 100)}%`
-          : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tier2Threshold} (1.5x) and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+          : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     } else if (
       config.tiers.enabled &&
       (t3CountReady ||
-        (t3Pen >= tier2Threshold && t3Pen > t2Pen && t3Pen > t1Eff))
+        (t3Pen >= tierThresholds[3] && t3Pen > t2Pen && t3Pen > t1Eff))
     ) {
       const lastShown = state.nudge.lastShownByTier[3] ?? 0;
       const cadenceMet =
@@ -1862,7 +1922,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
         injectedTier = 3;
         injectedReason = t3CountReady
           ? `T3 condense ready: ${t3Count} tier-2 blocks >= tier3Trigger ${config.tiers.tier3Trigger} (${t3Pen} tokens), usage ${Math.round(usage * 100)}%`
-          : `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tier2Threshold} (1.5x) and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+          : `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""} and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     }
   }
@@ -1891,11 +1951,11 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           ? t3Count >= config.tiers.tier3Trigger
           : false;
     const ready = eligible
-      .filter((t) => (tiers[t]?.pending ?? 0) >= nudgeGrowthTokens)
+      .filter((t) => (tiers[t]?.pending ?? 0) >= tierThresholds[t])
       .map((t) => `T${t} ${tiers[t]!.pending}`);
     const readyCount = eligible
       .filter(
-        (t) => (tiers[t]?.pending ?? 0) < nudgeGrowthTokens && countReady(t),
+        (t) => (tiers[t]?.pending ?? 0) < tierThresholds[t] && countReady(t),
       )
       .map((t) => `T${t} ${t === 2 ? t2Count : t3Count} blocks (count)`);
     const readyAll = [...ready, ...readyCount];
@@ -1904,7 +1964,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     const blocked = eligible
       .filter(
         (t) =>
-          ((tiers[t]?.pending ?? 0) >= nudgeGrowthTokens || countReady(t)) &&
+          ((tiers[t]?.pending ?? 0) >= tierThresholds[t] || countReady(t)) &&
           (state.nudge.lastShownByTier[t] ?? 0) > 0 &&
           tokenCount - (state.nudge.lastShownByTier[t] ?? 0) < growthFloor,
       )
@@ -1915,13 +1975,18 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // can have plenty to compress (pending >= threshold) but still not
     // inject because growth/floor/cadence isn't met — the old fixed
     // "< threshold" string lied in that case.
-    const pendingShort = maxPending < nudgeGrowthTokens;
+    // The floor below which NO tier can fire by mass; with all tiers unset
+    // this is exactly nudgeGrowthTokens (the T1 threshold is the minimum).
+    const minTierThreshold = Math.min(
+      tierThresholds[1],
+      tierThresholds[2],
+      tierThresholds[3],
+    );
+    const pendingShort = maxPending < minTierThreshold;
     const growthShort = growthSinceReference < growthFloor;
     const parts: string[] = [];
     if (pendingShort)
-      parts.push(
-        `max compressible ${maxPending} < threshold ${nudgeGrowthTokens}`,
-      );
+      parts.push(`max compressible ${maxPending} < threshold ${minTierThreshold}`);
     if (growthShort)
       parts.push(`growth ${growthSinceReference} < floor ${growthFloor}`);
     if (parts.length === 0)
@@ -2020,6 +2085,8 @@ function cloneState(state: CompressionState): CompressionState {
     hiddenOrphanRefs: state.hiddenOrphanRefs
       ? [...state.hiddenOrphanRefs]
       : undefined,
+    deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
+    lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
   };
 }
 

@@ -1,6 +1,7 @@
 import { orderedRefPair } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
+import { isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
 import { renderHandoff } from "../export.js";
@@ -819,7 +820,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     const pluginAgent = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
-    const conflicts = conflictEventsOf(session);
+    // #2430: bili's own siblings (billion-context-pi / opencode-acp) are compatible family,
+    // not conflicts — keep them out of the session evidence card so a siblings-only session
+    // renders no conflict block at all. Recording (acp_status #2261 calm footer) is unchanged.
+    const conflicts = conflictEventsOf(session).filter((e) => !(e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail)));
     const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;
 
     return {

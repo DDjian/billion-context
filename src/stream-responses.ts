@@ -40,7 +40,7 @@ function* rewriteResponsesJsonSteps(body: unknown, ctx: RewriteCtx): Generator<J
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const requestText = JSON.stringify(ctx.messages);
     if (containsRenderTagText(probe) || containsMarkerLineText(probe) || containsBiliInternalText(probe) || (absorbArmed && containsToolCallEmissionText(probe))) {
-        ctx.log(`[warn: tag echo] non-stream responses output contains ACP echo (render tags/markers/internal artifacts), stripped: ${probe.slice(0, 120).replace(/\n/g, " ")}`);
+        ctx.log(`[tag-echo] stripped: non-stream responses output ACP echo (render tags/markers/internal artifacts): ${probe.slice(0, 120).replace(/\n/g, " ")}`);
         stripResponsesText(b, absorbArmed, requestText);
     }
     let converted = false;

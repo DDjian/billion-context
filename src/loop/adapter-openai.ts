@@ -310,6 +310,15 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     loggerLog("warn", msg);
                 }
             };
+            // #2405(c): per-response strip total — see plugin.ts twin. n==1 is
+            // covered by its one-shot detail line, so stay silent there.
+            let stripSummarized = false;
+            const maybeSummarizeStrips = () => {
+                if (stripSummarized) return;
+                stripSummarized = true;
+                const total = contentFilter.stats().dropCount;
+                if (total > 1) loggerLog("warn", `[tag-echo] stripped ${total} occurrence(s) total in this response`);
+            };
             // Raw tool_call chunks in arrival order. Backends (SGLang/vLLM)
             // stream a tool name across MULTIPLE deltas — the first fragment
             // carries the name, continuation fragments carry empty names.
@@ -455,6 +464,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate("stop");
+                    maybeSummarizeStrips();
                     yield { kind: "done", finishReason: "stop", thinking: sawReasoning, ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
                     continue;
                 }
@@ -535,10 +545,12 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // bytes after the finish reason).
                         yield { kind: "meta", chunk } as ParsedStreamEvent;
                         maybeWarnDegenerate(finishReason);
+                        maybeSummarizeStrips();
                         yield { kind: "done", finishReason, suppressCompletion: true, thinking: sawReasoning } as ParsedStreamEvent;
                         continue;
                     } else {
                         maybeWarnDegenerate(finishReason);
+                        maybeSummarizeStrips();
                         yield {
                             kind: "done",
                             finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,

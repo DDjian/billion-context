@@ -12,7 +12,10 @@ import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
-import { foldCoverage, markDirty, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { compressBreakerArmed } from "../stream.js";
+import { foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { recordConflict } from "../conflict-watch.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
@@ -24,12 +27,12 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildTriggerForgeBody, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems } from "../codex-compact.js";
+import { buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import { stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "../acp-panel.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge } from "./budget.js";
+import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 
 export async function prepareResponses(
@@ -194,6 +197,47 @@ export async function prepareResponses(
         const absorbActive = absorbBlock?.enabled === true && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #2372/#2432: LOCAL auto-compaction — the client compacts on its own
+        // and the call never transits the proxy; the first the proxy hears of
+        // it is this request replaying [compaction summary, retained tail…].
+        // Without a boundary here the folded head's covered ids simply vanish:
+        // syncBlocks keeps partially-alive blocks active forever, fold anchors
+        // self-destruct on the first pass, and every later turn logs coverage
+        // drift without recovering (the #2193 escalation is observe-only).
+        // TWO producers replay that shape on this wire: codex (rollout event
+        // type:"compacted", #2372) and dsh desktop's compaction-basic
+        // checkpoint (#2432) — CONFIGURATION.md names responses "the lane dsh
+        // desktop's compaction actually rides" (#2360), yet before the #2451
+        // review this slot covered codex only and the dsh desktop scenario
+        // fell back into the pre-#2432 death spiral. Detect (client identity
+        // + summary template in a resent message + decimated fold coverage)
+        // and rebase through the same reset the /responses/compact endpoint
+        // path uses — mark + reconcile back-to-back resets NOW, so this turn's
+        // processTurn assigns fresh refs onto the compacted view instead of
+        // poisoning anchors first.
+        const codexLane = !isCompactionTrigger && isCodexClient(req.headers);
+        const dshLane = !isCompactionTrigger && session.metadata["pluginAgent"] === "dsh";
+        if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeLocalCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
+            const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
+            const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
+            const dshHit = dshLane && carriesDshLocalCompactionSummary(msgs);
+            if (localGap && (codexHit || dshHit)) {
+                const missing = localGap.expected - localGap.matched;
+                const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
+                if (missing >= minMissing && missing * 2 >= localGap.expected) {
+                    if (dshHit) {
+                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        log("warn", `[${sessionId}] dsh native compaction detected (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    } else {
+                        recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
+                        log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+                    }
+                    markNativeCompactionBoundary(session);
+                    reconcileNativeCompactionBoundary(session);
+                }
+            }
+        }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
@@ -230,7 +274,7 @@ export async function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && !compressBreakerArmed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
@@ -456,8 +500,14 @@ export async function prepareResponses(
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
     // mid-history items the kernel already classifies.
+    const loadedToolTokens = countLoadedToolTokens(rebuilt);
     if (transformOk) {
-        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut);
+        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut) + loadedToolTokens;
+        const catalogTokens = defaultCountTokens(JSON.stringify(toolsOut ?? []));
+        const visibleTokens = defaultCountTokens(JSON.stringify(modelVisibleTools(toolsOut)));
+        if (catalogTokens >= 50_000 || catalogTokens !== visibleTokens || loadedToolTokens > 0) {
+            log("info", `[${sessionId}] tool-budget catalog~${catalogTokens} visible~${visibleTokens} loaded~${loadedToolTokens} instruction~${defaultCountTokens(responsesDevContent ?? "")} tokens (estimates; definitions preserved)`);
+        }
     }
     // #728: record this turn's outbound payload upper bound as the fallback
     // token source for upstreams that never report usage (see effectiveTokenCount).
@@ -466,11 +516,13 @@ export async function prepareResponses(
     if (!isCompactionTrigger) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + loadedToolTokens
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + loadedToolTokens
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;

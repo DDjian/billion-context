@@ -94,7 +94,7 @@ test("finish while the host is idle delivers without waiting for a settle", asyn
   const { pi, sent } = mockPi();
   makeDelegateTool(pi);
   const run = mkRun("del_idle", "completed");
-  scheduleRunNotification(pi, run); // hostAgentRuns === 0 -> immediate deferred flush
+  scheduleRunNotification(pi, run); // activeRuns === 0 -> immediate deferred flush
   await waitFor(() => sent.length === 1, "idle wake");
   assert.ok(sent[0]!.includes("`del_idle`"));
 });

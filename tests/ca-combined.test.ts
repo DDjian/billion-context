@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import test from "node:test";
-import { combinedCaPath, collectOsStorePems, collectSystemCaPems, decodeOsStoreOutput, ensureRootCA, osStorePowerShellScript, parseOsStoreNdjson, pemFingerprint, rootCaPath, wrapDerPem } from "../src/ca.js";
+import { combinedCaPath, collectOsStorePems, collectSystemCaPems, decodeOsStoreOutput, ensureRootCA, osStoreExecOptions, osStorePowerShellScript, parseOsStoreNdjson, pemFingerprint, rootCaPath, wrapDerPem } from "../src/ca.js";
 import { resolveCombinedCaPath } from "../src/launcher.js";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -119,6 +119,13 @@ test("#1807: osStorePowerShellScript covers both Root stores without interpolati
     assert.ok(s.includes("X509Store('Root'"));
     assert.ok(s.includes("'LocalMachine','CurrentUser'"));
     assert.ok(!s.includes("${"));
+});
+
+test("#2439: the OS-store export spawns powershell hidden (GUI hosts flash a console otherwise)", () => {
+    const opts = osStoreExecOptions();
+    assert.equal(opts.windowsHide, true, "an unhidden console child makes Windows allocate a console window");
+    assert.equal(opts.timeout, 30_000);
+    assert.equal(opts.maxBuffer, 16 * 1024 * 1024);
 });
 
 test("#1807: collectOsStorePems degrades to [] where the platform tooling is absent", () => {

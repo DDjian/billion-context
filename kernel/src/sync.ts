@@ -45,6 +45,7 @@ export function syncBlocks(
     terminalStreak: state.terminalStreak,
     nextBlockId: state.nextBlockId,
     nextRunId: state.nextRunId,
+    deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so

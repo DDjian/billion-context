@@ -53,6 +53,12 @@ sha256;`assignRefs` 再 first-wins 挂 ref(`if (map.byRaw[message.id]) continue`
 
 公理应按失败模式更轻者选择。
 
+## 宿主必须在会话内保持工具调用 id 字节稳定
+
+hash 以 `toolCallId` 为因子,fold-reconcile 层(`src/fold-reconcile.ts`,#1921)以它为主 claim key:`tool_use.id` / `tool_call_id` 是唯一既按会话协议唯一、又能在客户端重序列化中原样存活的字段。这个前提只有一个外部依赖——**宿主自身**不得在把同一会话投影到另一 provider 时改写这些 id。#2396 找到了真实违例:Prime(pi 系运行时)把同一会话从 Codex 切到自定义 Responses provider,其外部 provider 转换器对存储的复合 id 重新做了净化——`call_switch_seed|fc_0_0` 在 Codex lane 序列化为 `call_switch_seed`,在外部 lane 却发出 `call_switch_seed_fc_0_0`,且每一对的两侧都改。两条 claim pass 都以该 id 为键,于是所有已折叠的工具对全部失配:按 ~66,525 input token 计费的内容以 558,541/562,549 重新进入 500,000 token 窗口的 wire。
+
+bili 的应对遵循上文的失败模式公理:**不猜** old→new 配对(猜了就是把"认不出"变成"认错"——decompress 在一个貌似合理的 id 替换后取回错误内容)。它只做形状检测:一个缺失 covered id,其**去掉 toolCallId** 的归一化身份与某个携带不同 toolCallId 的入站孪生消息相同,即计为一个 rewrite suspect 并在漂移日志中点名(#2396);原始内容则诚实地以未折叠状态重回 wire。义务在宿主一侧——见 PLUGIN.md("Obligations of a plugin"第 5 条):在 payload 到达代理之前于宿主边界规范化 id。#2396 中的 workaround(在处理前基于权威存储历史同步改写 `call_id` + `call_output.call_id`)就是这项义务的参考实现。
+
 ## hash 公理的已知代价——以及修复方向
 
 同字节 ⇒ 同身份有代价面:#1476——用户原样重发与已折叠内容相同的短文本;裸 `h_` id 重新派生;`isCovered()` 吞掉新消息。注意**修复方向**:kernel #459 加实例重编号(`_1/_2…`),#463 加 `lastPassIds` 快照区分折叠后**回声**(id ∈ covered ∧ ∈ 上一轮 → 保持 id,prune 吞掉)与真**新实例**(id ∈ covered ∧ ∉ 上一轮 → 重编号到空闲 `_k`)。content hash 始终是基座,只在其上叠加实例判别——连 hash 公理自己的 bug 都靠**保留 hash** 修,而不是退回位置 id。
@@ -80,9 +86,10 @@ DeepSeek 类网关要求客户端传回网关自己发出的 reasoning("the reas
 | 内容近似匹配 | 字节精确性是承重墙(同 `SESSION-IDENTITY.md` 论证);模糊 join 在 decompress 时静默认错。 |
 | 把 `msg-proxy-*` 升级为身份 | 单 lane、仅响应侧覆盖、通道易放大(标签回声证据)、上游命名空间约束。 |
 | 标记当身份(标签由宿主持久化) | 标签回声事故证明该通道会污染所载内容;现行设计已在两端剥离。 |
+| 隐式别名化宿主改写的工具调用 id | 把一个缺失 covered id 与"同内容、不同 toolCallId"的入站孪生配对需要宿主知识;没有它,claim 就是猜测,decompress 时认错(#2396:Prime 跨 provider 切换改写了复合 id)。只交付检测;修复属于宿主边界(PLUGIN.md 义务 5)。 |
 
 ## 未来方向
 
 若未来宿主或 lane 提供真正稳定的客户端消息 id,只允许作为**附加 join hint** 采纳——永不替代 content-hash 基座。在那之前:字节是锚,hash 是 join,mNNNNN 是账本,标签是视图。
 
-相关:#1496(本文档的起因)、`SESSION-IDENTITY.zh-CN.md`(会话粒度)、#1476 + kernel #459/#463(回声判别)、#242/#1475(Responses id 约束)、#206/#673(标签回声)、#1479/#1482(strict-echo 修复)、#1039(工具调用字节不变量)。
+相关:#1496(本文档的起因)、`SESSION-IDENTITY.zh-CN.md`(会话粒度)、#1476 + kernel #459/#463(回声判别)、#242/#1475(Responses id 约束)、#206/#673(标签回声)、#1479/#1482(strict-echo 修复)、#1039(工具调用字节不变量)、#2396(跨 provider 切换时宿主改写的工具调用 id)。

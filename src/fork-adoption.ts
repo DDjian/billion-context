@@ -1,11 +1,11 @@
 import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
-import { STORED_PLACEHOLDER_MARKER, type CompressionBlock, type CoreMessage } from "acp-kernel";
+import { STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { replaceBiliCompactionItems } from "./codex-compact.js";
 import { stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
-import { peekSession, markDirty, type Session } from "./session.js";
+import { peekSession, markDirty, reserveRefsThrough, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { adoptContentStore, cloneStoreForRefs, contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
@@ -257,6 +257,11 @@ function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Ses
     }
     session.state.nextBlockId = Math.max(session.state.nextBlockId, plan.nextBlockId);
     session.state.nextRunId = Math.max(session.state.nextRunId, plan.nextRunId);
+    // Seeded refs only cover messages present in the child, so the cursor
+    // would restart below refs the parent assigned to messages the child
+    // dropped (its failed tail, a rewound branch) — and the model's older
+    // text may still cite those. Reserve the parent's whole ref space.
+    reserveRefsThrough(session, highestUsedIndex(parent.state.messageRefs));
     markDirty(session);
 }
 

@@ -335,6 +335,15 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     loggerLog("warn", msg);
                 }
             };
+            // #2405(c): per-response strip total — see plugin.ts twin. n==1 is
+            // covered by its one-shot detail line, so stay silent there.
+            let stripSummarized = false;
+            const maybeSummarizeStrips = () => {
+                if (stripSummarized) return;
+                stripSummarized = true;
+                const total = tagFilter.stats().dropCount;
+                if (total > 1) loggerLog("warn", `[tag-echo] stripped ${total} occurrence(s) total in this response`);
+            };
 
             // #1455: a re-fetched stream (blind truncation retry) resumes the SAME logical
             // response — close the dead attempt's still-open blocks first, so the client
@@ -540,6 +549,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
+                    maybeSummarizeStrips();
                     yield { kind: "done", finishReason: stopReason, thinking: sawThinking, ...(deltaExtras ? { terminalExtra: deltaExtras } : {}) } as ParsedStreamEvent;
                 } else if (type === "message_stop") {
                     if (lastTextIndex !== null) {
@@ -562,6 +572,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
+                    maybeSummarizeStrips();
                     yield { kind: "done", finishReason: stopReason ?? "end_turn", thinking: sawThinking, ...(stopExtras ? { terminalExtra: stopExtras } : {}) } as ParsedStreamEvent;
                 } else if (round === 1) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;

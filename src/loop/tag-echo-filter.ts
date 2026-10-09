@@ -139,8 +139,26 @@ const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // acplike name and the body exactly one bare ref, so genuine HTML prose such
 // as "see </p>" or "<a>m1234 text</a>" is untouched. Runs BEFORE the lone
 // passes in stripAcpTags so the pair dies atomically instead of leaving the
-// ref behind.
-const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[a-zA-Z][a-zA-Z0-9]{0,15}>", "g");
+// ref behind. #2348 owner decision §4 (instance C): the close name class is
+// widened to any non-angle-bracket run — the census also contains FULLWIDTH
+// corrupt closes (`</｜｜DSML｜｜ parameter>`), which the ASCII class left as
+// orphan residue after the lone-open pass. {1,32} keeps a MINIMUM of one char
+// on purpose: an empty-name close (`m1234</>`) stays visible, it is more
+// likely shredded normal text than echo. Risk profile unchanged — the gate
+// still requires the valid acplike open AND the single-bare-ref body.
+const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[^<>]{1,32}>", "g");
+// #2348: the self-closing render-tag imitation: <name …/> and the bare <name/>.
+// The kernel never emits it (its emitter is paired-form only); the model
+// truncates the shape mid-way. It is a COMPLETE unit — the '/' before '>'
+// terminates the element — so it dies in place. Two failure modes when treated
+// like other opens: (1) streaming handed it to the LONE_OPEN swallow state,
+// whose EOF rule drops an attrs-bearing unclosed opening's tail — measured:
+// 57-char input around one such tag emitted 3 chars, following prose lost;
+// (2) the BARE form matched no matcher anywhere (every open-side pattern
+// requires whitespace or '>' directly after the name, never '/'), so it rode
+// every fast path verbatim with zero warns. The slash is MANDATORY here so a
+// genuine unterminated opening (<name …>) still takes the swallow/hold path.
+const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated \x3c<name> … opening (attrs so far, no \x3e yet — the
 // mangled \x3c<name>=… form counts too, #2066), a short
@@ -153,7 +171,7 @@ const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x
 // structure (over-cap-dropped openings, #644) and stay lossless. Held on the
 // small cap so a split unit can be stripped whole; a lone trailing ref with
 // no tag context is released at EOF, prose-safe.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "|(?<![\\w>])m\\d{0,3})$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "|(?<![\\w>])m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
@@ -163,6 +181,16 @@ const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$|\x3c" + NAME + "\\s*=\
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
 const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
+
+// #2348 v4 corpus (owner EMIT-COUNTS): the `</ap` missing-`>` family (213
+// ref-adjacent hits, 4th most common attested shape) ends a turn with a bare
+// ref flush against a close cut mid-name at the hard stream boundary. Ref
+// adjacency is the gate — prose never puts mNNNNN directly against a dangling
+// </word — so the rule drops [ref][truncated close] together instead of
+// leaving an orphan residue like the acplike-named case does. ASCII names
+// ≤32 mirror the §4 close-name class minus non-ASCII breadth (unattested
+// without the final >); the $ anchor keeps mid-text occurrences visible.
+const TRUNC_REF_CLOSE = new RegExp("m\\d{4,}\\s*\\x3c\\/([a-zA-Z]{0,32})$");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
@@ -224,7 +252,11 @@ function looseCloseEnd(s: string): number {
 // markup and keeps the existing hold/budget/flush behavior. Strict >
 // termination, same discipline as looseCloseSpan (a partial close at the
 // buffer end is still undecidable and stays held).
-const DEGEN_CLOSE_NAME = /^[a-zA-Z][a-zA-Z0-9]{0,15}>/;
+// #2348 §4: widened to any non-angle-bracket run so the streaming swallow
+// ends on fullwidth corrupt closes too — same {1,32} class as DEGEN_PAIR, so
+// both modes agree on where the span dies. The termination still routes
+// through drop(), i.e. the existing [tag-echo] warn callback (owner §4(b)).
+const DEGEN_CLOSE_NAME = /^[^<>]{1,32}>/;
 // Single bare ref, exactly one (#2190 DEGEN_PAIR body rule); standalone const so
 // this stays valid when the master REF_* token constants churn (#2025 stack compat, #2229).
 const SINGLE_REF_BODY = /^\s*m\d{4,}\s*$/;
@@ -295,6 +327,9 @@ export interface TagEchoFilterStats {
     outputChars: number;
     /** Whether anything was dropped as an imitation. */
     dropped: boolean;
+    /** Stripped echo artifacts (one per logical occurrence — a pair split across
+     *  pushes or a multi-chunk imitation counts once), lifetime. #2405(c). */
+    dropCount: number;
 }
 
 export interface TagEchoFilter {
@@ -390,11 +425,13 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(DEGEN_PAIR, "")
+        .replace(new RegExp(SELF_CLOSE.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
+        .replace(new RegExp(TRUNC_REF_CLOSE.source), "")
         .replace(MARKER_LINE, "");
     return stripBiliArtifacts(out);
 }
@@ -412,7 +449,10 @@ export function containsMarkerLineText(s: string): boolean {
 // contain anything that looks like a render tag (literal or JSON-escaped
 // \u003c form)? Callers use this to skip re-serializing chunks that need
 // no stripping, preserving byte-identical passthrough.
-const RENDER_TAG_DETECT = new RegExp("\x3c\\/?" + NAME + "(?=[\\s>])|\\\\u003c\\/?" + NAME + "(?=[\\s>\\\\])");
+// #2348: the self-closing alternatives match through the '/' only — a chunk
+// cut right after it is held by PARTIAL_TAIL instead, and over-engaging costs
+// one no-op pass while under-engaging forwards the tag raw.
+const RENDER_TAG_DETECT = new RegExp("\x3c\\/?" + NAME + "(?=[\\s>])|\\\\u003c\\/?" + NAME + "(?=[\\s>\\\\])|\x3c" + NAME + "\\s*\\/|\\\\u003c" + NAME + "\\s*\\/");
 export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
@@ -742,7 +782,7 @@ export function mayStartBiliInternal(s: string): boolean {
 // those as residue made every bare-citation answer read as degenerate and fire
 // the one-shot retry (#732/#821) on a healthy turn. Tagged echoes need no help
 // here: their drop already sets sawStrippedEcho upstream.
-const TAG_PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
+const TAG_PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?)$");
 export function isOrphanMarkupText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s) || TAG_PARTIAL_TAIL.test(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
 }
@@ -760,8 +800,10 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     let notified = false;
     let inputChars = 0;
     let outputChars = 0;
+    let dropCount = 0;
     const drop = (snippet: string) => {
         droppedAny = true;
+        dropCount++;
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
@@ -837,7 +879,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
         },
         dropped: () => droppedAny,
         pending: () => buf.length > 0 || swallowing,
-        stats: () => ({ inputChars, outputChars, dropped: droppedAny }),
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
     };
 }
 
@@ -874,12 +916,33 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     let notified = false;
     let inputChars = 0;
     let outputChars = 0;
-    const drop = (snippet: string) => {
+    let dropCount = 0;
+    // #2405(c) review: count LOGICAL ARTIFACTS, not state-machine drop calls.
+    // A pair split across pushes drops its opening and its completion as two
+    // calls yet is one artifact (SSE deltas split tags arbitrarily, so call
+    // counting would double most production tags); a wrapped imitation past
+    // the cap drops repeatedly until its close. swallowSessionCounted keeps
+    // any one swallow session at exactly one count.
+    let swallowSessionCounted = false;
+    const recordDrop = (snippet: string) => {
         droppedAny = true;
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
         }
+    };
+    /** One self-contained artifact resolved by a single drop call. */
+    const drop = (snippet: string) => {
+        dropCount += 1;
+        recordDrop(snippet);
+    };
+    /** Any drop inside a live swallow session — the session counts once. */
+    const dropSwallowSpan = (snippet: string) => {
+        if (!swallowSessionCounted) {
+            dropCount += 1;
+            swallowSessionCounted = true;
+        }
+        recordDrop(snippet);
     };
     /** Character immediately before the refs run of an orphan-unit match —
      *  within the buffer, or the last emitted char when the run sits at the
@@ -904,10 +967,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // whatever the body is.
                     const inner = combined.slice(0, span.start);
                     if (REFS_ONLY.test(inner) || !swallowReleases) {
-                        drop(combined.slice(0, span.end));
+                        dropSwallowSpan(combined.slice(0, span.end));
                     } else {
                         out += inner;
-                        drop(combined.slice(span.start, span.end));
+                        dropSwallowSpan(combined.slice(span.start, span.end));
                     }
                     swallowed = "";
                     swallowUntilClose = false;
@@ -922,7 +985,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // markup and must be discarded whole).
                     const dspan = degenCloseAfterRef(combined);
                     if (dspan !== null) {
-                        drop(combined.slice(0, dspan.end));
+                        dropSwallowSpan(combined.slice(0, dspan.end));
                         swallowed = "";
                         swallowUntilClose = false;
                         buf = combined.slice(dspan.end);
@@ -936,7 +999,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         // marker list, not prose — discard it. Mixed tails are
                         // content and still release losslessly.
                         if (REFS_ONLY.test(combined)) {
-                            drop(combined);
+                            dropSwallowSpan(combined);
                             return out;
                         }
                         swallowUntilClose = false;
@@ -946,13 +1009,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     }
                     // The span is an attested imitation's payload: discard it and
                     // keep swallowing, so no part of it reaches the client.
-                    drop(combined);
+                    dropSwallowSpan(combined);
                     return out;
                 }
                 swallowed = combined;
                 return out;
             }
             const p = PAIRED.exec(buf);
+            // #2348: listed before o — at equal index the complete self-closing
+            // unit wins over LONE_OPEN's unclosed-opening interpretation.
+            const s = SELF_CLOSE.exec(buf);
             const o = LONE_OPEN.exec(buf);
             const c = LONE_CLOSE.exec(buf);
             // Orphan unit (#2023): only reached when no opening is live — a
@@ -968,7 +1034,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // LONE_CLOSE on its own).
             const g = MANGLED_OPEN.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, o, c, r, g]) {
+            for (const cand of [p, s, o, c, r, g]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
@@ -988,7 +1054,8 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // list ends at its `>`, which the class cannot cross.
             const broken = BROKEN_ATTRS.exec(buf);
             if (broken && (m === null || broken.index < m.index)) {
-                drop(broken[0]);
+                swallowSessionCounted = false;
+                recordDrop(broken[0]);
                 out += buf.slice(0, broken.index);
                 buf = buf.slice(broken.index + broken[0].length);
                 swallowUntilClose = true;
@@ -1021,7 +1088,6 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 }
                 break;
             }
-            drop(m[0]);
             out += buf.slice(0, m.index);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
@@ -1033,9 +1099,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // follows in this same chunk: then the bare open wraps or sits
             // beside inner markup, so drop it alone and let the loop decide
             // the inner structure on its own merits (#1720 nesting).
+            // Artifact counting (#2405c review): a session-starting open is
+            // recorded without counting here — its artifact completes at the
+            // session's first counted span; every other match is self-contained.
             if (m === o) {
                 const bare = !OPEN_WITH_ATTRS.test(m[0]);
-                if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) continue;
+                if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) {
+                    drop(m[0]);
+                    continue;
+                }
+                swallowSessionCounted = false;
+                recordDrop(m[0]);
                 // An odd number of quotes means the opening's attribute list
                 // never closed: the model wrapped its turn inside the value (the
                 // sibling shape opens with such a value and then runs into a `<`,
@@ -1049,6 +1123,8 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 swallowReleases = !wrapped;
                 swallowBareOpen = bare;
                 swallowed = "";
+            } else {
+                drop(m[0]);
             }
         }
         return out;
@@ -1126,7 +1202,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // imitation (never released, #1720), or an attrs-bearing
                 // opening whose tail never closed — that tail is tag content
                 // (a ref, possibly truncated), not prose (#644 EOF rule).
-                if (rest.length > 0) drop(rest);
+                if (rest.length > 0) dropSwallowSpan(rest);
                 result = "";
             } else if (wasSwallowing) {
                 // A BARE opening (#1881): prose may genuinely wear one, so an
@@ -1135,15 +1211,15 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // truncated open/close tail is dead markup.
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    drop(t[0]);
+                    dropSwallowSpan(t[0]);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        drop(tc[0]);
+                        dropSwallowSpan(tc[0]);
                         result = rest.slice(0, tc.index);
                     } else if (REFS_ONLY.test(rest)) {
-                        drop(rest);
+                        dropSwallowSpan(rest);
                         result = "";
                     } else {
                         result = rest;
@@ -1164,6 +1240,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     }
                 }
             }
+            // #2348 v4: same hard-cut tail as the whole-text TRUNC_REF_CLOSE
+            // pass, applied to whatever survives the branch above so both
+            // modes agree at true EOF.
+            const cut = TRUNC_REF_CLOSE.exec(result);
+            if (cut !== null) {
+                drop(result.slice(cut.index));
+                result = result.slice(0, cut.index);
+            }
             if (result.length > 0) lastEmitted = result[result.length - 1];
             if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
             outputChars += result.length;
@@ -1176,7 +1260,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             return held.length > 0 || swallowUntilClose;
         },
         stats(): TagEchoFilterStats {
-            return { inputChars, outputChars, dropped: droppedAny };
+            return { inputChars, outputChars, dropped: droppedAny, dropCount };
         },
     };
 }
@@ -1315,9 +1399,11 @@ export function createMarkerLineFilter(onDrop?: (snippet: string) => void): TagE
     let notified = false;
     let inputChars = 0;
     let outputChars = 0;
+    let dropCount = 0;
 
     const noteDrop = (snippet: string) => {
         droppedAny = true;
+        dropCount++;
         if (!notified) {
             notified = true;
             onDrop?.(snippet);
@@ -1386,7 +1472,7 @@ export function createMarkerLineFilter(onDrop?: (snippet: string) => void): TagE
         },
         dropped: () => droppedAny,
         pending: () => buf.length > 0,
-        stats: () => ({ inputChars, outputChars, dropped: droppedAny }),
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
     };
 }
 
@@ -1407,6 +1493,7 @@ export function composeStreamFilters(a: TagEchoFilter, b: TagEchoFilter): TagEch
             inputChars: a.stats().inputChars,
             outputChars: b.stats().outputChars,
             dropped: a.dropped() || b.dropped(),
+            dropCount: a.stats().dropCount + b.stats().dropCount,
         }),
     };
 }
@@ -1428,6 +1515,6 @@ export function createIdentityStreamFilter(): TagEchoFilter {
         flush: () => "",
         dropped: () => false,
         pending: () => false,
-        stats: () => ({ inputChars, outputChars, dropped: false }),
+        stats: () => ({ inputChars, outputChars, dropped: false, dropCount: 0 }),
     };
 }

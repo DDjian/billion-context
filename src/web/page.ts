@@ -11,17 +11,18 @@ function escapeHtml(value: string): string {
         char === "&" ? "&amp;" : char === "<" ? "&lt;" : char === ">" ? "&gt;" : char === '"' ? "&quot;" : "&#39;");
 }
 
-export function renderPage(origin: string, version: string): string {
+export function renderPage(origin: string, version: string, embed = false): string {
     const o = escapeHtml(origin);
     const caPath = rootCaPath();
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body>
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
 <header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="plugin-advisory-banner" class="banner warn" hidden></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">
@@ -69,12 +70,11 @@ export function renderPage(origin: string, version: string): string {
 <div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <div style="margin-top:14px"><button id="save-quick" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>
-<section id="summary-settings" class="summary-settings">
-<h2 data-i18n="summary.title">${zh("summary.title")}</h2>
+<div class="card" id="summary-settings"><div class="card-h"><span data-i18n="summary.title">${zh("summary.title")}</span></div><div class="card-b">
 <div id="summary-fields"></div>
 <div class="cfg-dirty-note small" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <button id="save-summary" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button>
-</section>
+</div></div>
 <div class="card" id="card-file"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>
 <dl class="kv"><div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="cfg-path" class="mono dim small"></span><button id="copy-cfg-file" class="btn sm copy-btn" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></dl>

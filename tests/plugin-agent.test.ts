@@ -158,7 +158,14 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean;
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    return { origin, toolCalls, registers, runtimeInfos, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    // Idempotent close: respawn tests kill the "old" proxy mid-test and the
+    // finally block closes it again.
+    let closed = false;
+    return { origin, toolCalls, registers, runtimeInfos, close: () => {
+        if (closed) return Promise.resolve();
+        closed = true;
+        return new Promise<void>((resolve) => server.close(() => resolve()));
+    } };
 }
 
 test("shared manifest/tool/status against a fake proxy", async () => {
@@ -765,6 +772,47 @@ test("#2204: a business-failure receipt (ok:true + outcome:failure) reaches the 
         assert.match(out.content[0]!.text, /could not write export/);
     } finally {
         await proxy.close();
+    }
+});
+
+test("#2416: registered tools track the respawned proxy origin — live re-read per call, no restart", async () => {
+    const oldProxy = await startFakeProxy();
+    const newProxy = await startFakeProxy();
+    const prevEnv = process.env.BILLION_CONTEXT_PROXY;
+    // Native-mode shape: the model baseUrl is the REAL upstream (no /bili/
+    // prefix), so the proxy origin lives ONLY in BILLION_CONTEXT_PROXY — the
+    // channel the interceptor rewrites when it respawns the proxy mid-session
+    // (pi-native.ts writes process.env.BILLION_CONTEXT_PROXY on
+    // (re-)establishment). The captured-at-registration base must not outlive
+    // the origin it names.
+    const ctx = {
+        sessionManager: { getSessionId: () => "sess-42" },
+        model: { contextWindow: 1000000, baseUrl: "https://api.example.com/v1" },
+        cwd: "/tmp",
+    };
+    process.env.BILLION_CONTEXT_PROXY = oldProxy.origin;
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, ctx);
+        await waitForTools(pi, 2);
+        let out = await pi.tools[0]!.execute("call-1", { content: [] }, undefined, undefined, ctx);
+        assert.equal(out.isError, undefined, "baseline: first call lands on the registered origin");
+        assert.equal(oldProxy.toolCalls.length, 1);
+        assert.equal(newProxy.toolCalls.length, 0);
+        // Respawn: the old proxy dies and the interceptor publishes the new
+        // origin through the env channel. No host restart, no re-registration.
+        await oldProxy.close();
+        process.env.BILLION_CONTEXT_PROXY = newProxy.origin;
+        out = await pi.tools[0]!.execute("call-2", { content: [] }, undefined, undefined, ctx);
+        assert.equal(out.isError, undefined, "the tool must reach the respawned proxy, not keep firing at the dead port");
+        assert.match(out.content[0]!.text, /\[Compressed/);
+        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.equal(oldProxy.toolCalls.length, 1, "nothing further may hit the dead origin");
+    } finally {
+        if (prevEnv === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = prevEnv;
+        await Promise.allSettled([oldProxy.close(), newProxy.close()]);
     }
 });
 

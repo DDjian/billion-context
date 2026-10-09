@@ -1,5 +1,6 @@
 import {
     buildStatusReport,
+    countMessageTokens,
     defaultCountTokens,
     formatRanges,
     viableRanges,
@@ -13,6 +14,7 @@ import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
+import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
@@ -37,6 +39,36 @@ function fmtBytes(n: number): string {
     return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
 }
 
+// #2366: usage fraction at which the PRESSURE NOTE becomes worth showing —
+// below it the window still has headroom and "stop folding" is noise.
+const PRESSURE_NOTE_USAGE_FRACTION = 0.6;
+// #2362: render dead refs as compact ref spans ("m09539, m09543–m09558").
+function formatDeadRefSpans(refs: string[]): string {
+    const nums = refs
+        .map((r) => Number(r.replace(/\D/g, "")))
+        .filter((n) => Number.isFinite(n))
+        .sort((a, b) => a - b);
+    const f = (n: number): string => `m${String(n).padStart(5, "0")}`;
+    const spans: string[] = [];
+    let start = -1;
+    let prev = -1;
+    const flush = (): void => {
+        if (start < 0) return;
+        spans.push(start === prev ? f(start) : `${f(start)}–${f(prev)}`);
+    };
+    for (const n of nums) {
+        if (prev >= 0 && n === prev + 1) {
+            prev = n;
+            continue;
+        }
+        flush();
+        start = n;
+        prev = n;
+    }
+    flush();
+    return spans.length > 8 ? `${spans.slice(0, 8).join(", ")} (+${spans.length - 8} more)` : spans.join(", ");
+}
+
 export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): ProxyToolResult {
     const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
@@ -56,6 +88,58 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     });
     if (scope) return toolOk(base);
     const extra: string[] = [];
+    // #2366: everything in the report above is LOCAL ESTIMATES (defaultCountTokens);
+    // on CJK-heavy routes upstream billing runs 2–4× higher, so an agent judging
+    // pressure from those figures misreads a filling window as healthy and folds
+    // late, when little compressible mass is left. Surface the usage-grade reading
+    // next to the estimate view — statusInputBaseline's provenance contract, the
+    // same number the nudge decision runs on — and flag the ratio when it diverges
+    // hard. Never-reporting upstreams have no anchor → no line.
+    const billed = statusInputBaseline(ctx.session);
+    if (billed > 0) {
+        let estTotal = 0;
+        // #2407: count host-projected thinking mass (countMessageTokens) so the
+        // ratio stays honest on thinking routes — same caliber as the per-message
+        // breakdown the kernel renders above.
+        for (const m of ctx.messages) estTotal += countMessageTokens(m, defaultCountTokens);
+        // Billed input covers system+tools too (and images); the est view must
+        // carry the same overhead — every prepare site keeps
+        // metadata.systemPromptTokens current — or every system-heavy session
+        // reads as divergence with no tokenizer gap behind it.
+        const sysOverhead = ctx.session.metadata?.systemPromptTokens;
+        if (typeof sysOverhead === "number" && sysOverhead > 0) estTotal += sysOverhead;
+        const srcLabel = ctx.session.stats.lastInputTokensSource === "overflow-arm" ? "overflow arm (bounded)" : "upstream usage";
+        let billedLine = `BILLED INPUT (${srcLabel}): ${billed} tok`;
+        const measuredAt = ctx.session.metadata?.contextTokensAt;
+        if (typeof measuredAt === "number") {
+            const ageMin = Math.round((Date.now() - measuredAt) / 60_000);
+            if (ageMin >= 2) billedLine += `, measured ${ageMin}m ago`;
+        }
+        if (estTotal > 0) billedLine += ` · est-view total ${estTotal} tok · ratio ${(billed / estTotal).toFixed(1)}×`;
+        extra.push("");
+        extra.push(billedLine);
+        if (estTotal > 0 && billed / estTotal >= 1.5) {
+            extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
+        }
+    }
+    // #2432: while the compress circuit breaker is armed, advertising ranges
+    // here contradicts the breaker receipt ("STOP calling compress now") and
+    // feeds the exact retry loop the breaker exists to kill — every model that
+    // follows the list fails the same way and climbs the counter. The receipt
+    // wording stays verbatim (#2146 owner decision); this surface gets the
+    // armed state instead, with the counter visible (issue expected behavior 4).
+    const breaker = compressBreakerDetail(ctx.session);
+    // #2451 review (v2): the table is always reported — see the comment at
+    // the formatRanges call site for the live-by-construction argument. These
+    // flags only pick WHICH honest annotation rides along: a substrate-
+    // destruction attribution arms the receipt's single recovery step ("run
+    // acp_status once, then compress ONLY a range it currently reports as
+    // compressible; one success clears this breaker"), so the armed note must
+    // point at the live table; every other cause mirrors the receipt's STOP
+    // order instead of inventing a second command (#2360 two-orders shape).
+    const lastCause = compressLastFailureCause(ctx.session);
+    const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
+    const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
     try {
         const turn = ctx.core.processTurn({
             messages: ctx.messages,
@@ -69,12 +153,27 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (nudge) {
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
+            // #2366: high billed pressure + exhausted compressible mass is the
+            // deadlock invisible from the estimate view alone — tell the agent
+            // further folding is futile (each fold rewrites the prefix and
+            // forfeits the cache hit for almost-nothing reclaimed).
+            if (!nudge.shouldInject && nudge.contextUsage >= PRESSURE_NOTE_USAGE_FRACTION && nudge.breakdown.maxPending < nudge.breakdown.nudgeGrowthTokens) {
+                extra.push(`PRESSURE NOTE: billed input sits at ${Math.round(nudge.contextUsage * 100)}% of the ${ctx.config.modelContextLimit}-token limit while max compressible mass is only ~${nudge.breakdown.maxPending} tokens — little left to fold. Repeated small folds rewrite the prefix (forfeiting cache hits) while reclaiming almost nothing; continue the task instead of folding again unless pressure climbs further.`);
+            }
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
             // be "viable" yet deterministically uncompressible.
             const minChars = ctx.config.compress.minCompressRange;
             const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
+            // #2451 review (v2): the table is ALWAYS reported. It is live by
+            // construction — buildCompressibleRanges (kernel/src/recommend.ts)
+            // derives refs from the CURRENT resent view only (byRaw[msg.id]),
+            // after screening covered/media/protected/withdrawn messages — so
+            // an advertised range always anchors. Hiding it behind
+            // cause-string policy is how the receipt-vs-status contradiction
+            // (#2451 M2) was born; anti-loop pressure belongs to the receipts
+            // (which carry the STOP order), not to lying by omission here.
             if (ranges.length > 0 || protectedRanges.length > 0) {
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
@@ -82,6 +181,38 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
+    }
+    // #2362: dead refs — known to the session but no longer backed by any
+    // visible or folded message (client history rewrite / host-native
+    // compaction). Failure receipts point the model at acp_status, so this is
+    // the canonical surface where the dead set must be visible.
+    const deadRefs = ctx.session.state.deadRefs;
+    if (deadRefs !== undefined && deadRefs.length > 0) {
+        extra.push("");
+        extra.push(`DEAD REFS — ${deadRefs.length} ref(s) no longer back any visible or folded message (the client history no longer carries them — host-native compaction or a bulk rewrite). Ranges citing them can NEVER compress; target only the live refs listed above: ${formatDeadRefSpans(deadRefs)}`);
+    }
+    if (breaker) {
+        extra.push("");
+        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
+        if (substrateDestroyed) {
+            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one success clears this breaker. If no ranges are listed, continue the task without compressing.");
+        } else {
+            extra.push("The Compressible-ranges list above was re-derived from the current view — the table is live; it is the earlier attempts that failed, not these ranges. Per the failure receipt: do not attempt to compress now; continue the task.");
+        }
+    }
+    // #2451 review (v2): the standalone paragraphs state the failure CAUSE and
+    // its recovery path; they no longer claim the list is suppressed (it never
+    // is now). The fresh-conversation advice stays pre-arming only — when the
+    // breaker is armed on substrate-destruction the tailored armed line above
+    // IS the recovery order, and a second order would recreate the
+    // two-orders-in-one-output #2360 shape.
+    if (staleRef || (substrateDestroyed && breaker === undefined)) {
+        extra.push("");
+        if (staleRef) {
+            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed belong to another session generation; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
+        } else {
+            extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
+        }
     }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.

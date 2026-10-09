@@ -131,6 +131,37 @@ export function isDshCompactionCall(protocol: string | null, parsed: unknown): b
     return finalUser.trimStart().startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX);
 }
 
+// #2432: dsh compaction-basic's CHECKPOINT FRAMING — the single replacement
+// user message a LANDED compaction writes into the client's history
+// (CHECKPOINT_PREAMBLE + SUMMARY_OPEN_TAG … SUMMARY_CLOSE_TAG,
+// @deepseek-ai/dsh-compaction-basic 0.2.x lib/index.js). Version-pinned like
+// DSH_COMPACTION_INSTRUCTION_PREFIX (#970): if these bytes drift the detector
+// silently stops matching and degrades to the pre-#2432 unannounced-rewrite
+// archive path — never a false positive. Angle brackets hex-escaped per KDD #2.
+export const DSH_CHECKPOINT_OPEN_TAG = "\x3ccompacted-summary\x3e";
+export const DSH_CHECKPOINT_PREAMBLE_PREFIX =
+    "This is an automatically generated checkpoint condensing an earlier span of the conversation";
+
+// #2432: floor on decimated fold coverage for local-compaction detection — the
+// same bar as codex's CODEX_LOCAL_COMPACTION_MIN_MISSING (#2373): below it,
+// missing ids are ordinary drift (edit/truncate), not a region replacement.
+export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
+
+/** True when any RESENT core message carries dsh checkpoint framing (preamble
+ *  at message start, or the open tag anywhere — the tag sits mid-message after
+ *  preamble + blank line). Used by the prepare-openai detector (#2432) to tell
+ *  a landed native compaction apart from ordinary history churn. Reads the
+ *  core-flattened text first (BiliMessage/CoreMessage carry prose in `.text`),
+ *  falling back to a raw wire content field for direct callers. */
+export function carriesDshLocalCompactionSummary(msgs: readonly { text?: unknown; content?: unknown }[]): boolean {
+    for (const m of msgs) {
+        const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
+        if (text === "") continue;
+        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;
+    }
+    return false;
+}
+
 export type Refusal = { status: number; body: unknown };
 
 const REFUSAL_MESSAGE =

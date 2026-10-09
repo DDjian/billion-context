@@ -133,6 +133,67 @@ test("install: holds the first model request until toolsReady, then stamps (#126
     assert.equal(sink[0].headers["x-bili-plugin-conversation"], "session-1");
 });
 
+test("install: beforeSend runs after the tools gate and before headersFor on rewrites (#2399)", async () => {
+    const order: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40004",
+        ready: Promise.resolve("http://127.0.0.1:40004"),
+        toolsReady: Promise.resolve(),
+        headersFor: () => {
+            order.push("headersFor");
+            return { "x-bili-plugin": "dsh" };
+        },
+        beforeSend: async () => {
+            order.push("beforeSend");
+        },
+    };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(order, ["beforeSend", "headersFor"]);
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].headers["x-bili-plugin"], "dsh");
+});
+
+test("install: a throwing beforeSend never breaks the request (#2399)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40005",
+        ready: Promise.resolve("http://127.0.0.1:40005"),
+        beforeSend: async () => {
+            throw new Error("adoption exploded");
+        },
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "{}" });
+        assert.equal(res.status, 200);
+    });
+    assert.equal(sink.length, 1);
+});
+
+test("install: routed /bili/ model URLs also await beforeSend before stamping (#2399)", async () => {
+    const order: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40006",
+        ready: Promise.resolve("http://127.0.0.1:40006"),
+        toolsReady: Promise.resolve(),
+        headersFor: () => {
+            order.push("headersFor");
+            return { "x-bili-plugin": "dsh" };
+        },
+        beforeSend: async () => {
+            order.push("beforeSend");
+        },
+    };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:40006/bili/http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(order, ["beforeSend", "headersFor"]);
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].headers["x-bili-plugin"], "dsh");
+});
+
 test("install: toolsReady timeout falls back to wire mode; later requests stamp (#1268)", async () => {
     let readyFlag = false;
     const toolsReady = new Promise<void>((r) => {
