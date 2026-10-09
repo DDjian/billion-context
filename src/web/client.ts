@@ -81,33 +81,51 @@ export const WEB_CLIENT = `(function () {
         if (hidden > 0) line += " · …+" + hidden + " more (GET /__bili/stats → conflicts)";
         return line;
     }
-    // #2324: pick the banner title/risk wording from the ledger families present. Name-only
-    // [suspected] matches are NEVER treated as confirmed compressors — they get a softer
-    // "verify first" framing, not the imperative double-compression warning. Old payloads
-    // without c.suspected degrade to the previous all-confirmed view. Pure (reads only c),
-    // exported for tests the same way bili_conflictLine is.
+    // #2324/#2545: pick the banner title/risk wording from the ledger EVIDENCE TIERS.
+    // CONFIRMED = non-suspected third-party plugin findings + detected native-compaction
+    // landings only. UNCONFIRMED SIGNALS = unannounced rewrites + orphan reaps (observed
+    // history changes whose cause is NOT identified) — counting them as confirmed turned
+    // one unexplained rewrite into a "two compressors on one conversation" alarm (#2545);
+    // they outrank name-only [suspected] matches (an observed change is stronger than a
+    // name guess), so any signal takes the unconfirmed tier even next to suspected names.
+    // SUSPECTED-ONLY keeps the #2324 verify-first tier. Siblings and verified read-only
+    // (display-only) plugins are NEUTRAL. Old payloads without c.suspected / c.displayOnly
+    // degrade to the previous view; without c.activeConfirmed, liveness falls back to c.active.
+    // Pure (reads only c), exported for tests the same way bili_conflictLine is.
     function bili_conflictSeverity(c) {
-        const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
+        const kinds = c.kinds || {};
+        const pluginN = kinds["third-party-plugin"] || 0;
         const siblingN = Math.max(0, Math.min(typeof c.sibling === "number" ? c.sibling : 0, pluginN));
-        const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN));
-        const confirmedTpN = Math.max(0, pluginN - siblingN - suspectedN);
-        const nativeN = Math.max(0, c.events - pluginN);
+        // Stock ledgers written by pre-#1736 keyword rules carry display-only plugins as
+        // [suspected]; subtract display-only BEFORE suspected so they count for no severity.
+        const displayOnlyN = Math.max(0, Math.min(typeof c.displayOnly === "number" ? c.displayOnly : 0, pluginN - siblingN));
+        const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN - displayOnlyN));
+        const confirmedTpN = Math.max(0, pluginN - siblingN - displayOnlyN - suspectedN);
+        const confirmedNativeN = kinds["native-compaction"] || 0;
+        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN);
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
         if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
         // #2430: siblings are family, never a warning — they no longer appear in the
         // "what" enumeration even in mixed ledgers (pure-sibling banners are hidden outright).
-        if (nativeN > 0) whatParts.push(t("conflict.what_native"));
+        if (confirmedNativeN > 0) whatParts.push(t("conflict.what_native"));
+        if (signalN > 0) whatParts.push(t("conflict.what_signal"));
         const active = typeof c.active === "number" ? c.active : c.events;
-        const hasConfirmed = confirmedTpN > 0 || nativeN > 0;
+        // Liveness of the CONFIRMED evidence itself — a fresh unconfirmed signal must not
+        // re-light a stale confirmed ledger as a live alarm.
+        const activeConfirmed = typeof c.activeConfirmed === "number" ? Math.min(c.activeConfirmed, active) : active;
+        const hasConfirmed = confirmedTpN > 0 || confirmedNativeN > 0;
         // Resolve each branch through a direct translate call (not a key-to-text lookup table)
         // so the #1024 static ref-scanner still counts every conflict.* key used here; surface
         // both the key (locale-independent, asserted by tests) and the rendered text.
         let onKey, riskKey, onText, riskText;
         if (hasConfirmed) {
             onKey = "conflict.on"; onText = t("conflict.on");
-            if (active > 0) { riskKey = "conflict.risk_active"; riskText = t("conflict.risk_active"); }
+            if (activeConfirmed > 0) { riskKey = "conflict.risk_active"; riskText = t("conflict.risk_active"); }
             else { riskKey = "conflict.risk_historical"; riskText = t("conflict.risk_historical"); }
+        } else if (signalN > 0) {
+            onKey = "conflict.on_unconfirmed"; onText = t("conflict.on_unconfirmed");
+            riskKey = "conflict.risk_unconfirmed"; riskText = t("conflict.risk_unconfirmed");
         } else if (suspectedN > 0) {
             onKey = "conflict.on_suspected"; onText = t("conflict.on_suspected");
             riskKey = "conflict.risk_suspected"; riskText = t("conflict.risk_suspected");
@@ -115,10 +133,11 @@ export const WEB_CLIENT = `(function () {
             onKey = "conflict.on"; onText = t("conflict.on");
             riskKey = "conflict.risk_sibling"; riskText = t("conflict.risk_sibling");
         }
-        // #2430: a ledger that is ONLY bili's own siblings stands down completely — they are
-        // compatible family, not conflicts; the web banner must stay hidden for them.
-        const siblingOnly = !hasConfirmed && suspectedN === 0 && siblingN > 0;
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, what: whatParts.join(t("conflict.what_join")), active: active };
+        // #2430/#2545: a ledger naming ONLY bili's own siblings or verified read-only viewers
+        // stands down completely — compatible family / non-compressors, not conflicts.
+        const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
+        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN) > 0;
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
@@ -488,11 +507,12 @@ export const WEB_CLIENT = `(function () {
         const cb = $("conflicts-banner");
         if (cb) {
             const c = d.conflicts;
-            // #2430: siblings-only ledgers stand down — bili's own family (billion-context-pi /
-            // opencode-acp) is compatible, so a pure-sibling ledger is not a warning. The events
-            // stay recorded (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            // #2430/#2545: neutral-only ledgers stand down — bili's own family (billion-
+            // context-pi / opencode-acp) is compatible and verified read-only viewers are not
+            // compressors, so such ledgers are not warnings. The events stay recorded
+            // (acp_status keeps the calm #2261 footer); only the banner goes quiet.
             const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
-            if (c && c.events > 0 && !(sev0 && sev0.siblingOnly)) {
+            if (c && c.events > 0 && !(sev0 && sev0.neutralOnly)) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
@@ -506,8 +526,10 @@ export const WEB_CLIENT = `(function () {
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
                 cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
-                cb.classList.toggle("info", !(sev.hasConfirmed && sev.active > 0));
-                cb.classList.toggle("warn", sev.hasConfirmed && sev.active > 0);
+                // #2545: red styling follows CONFIRMED liveness — a fresh unconfirmed
+                // signal beside a stale confirmed ledger renders as info, not warn.
+                cb.classList.toggle("info", !(sev.hasConfirmed && sev.activeConfirmed > 0));
+                cb.classList.toggle("warn", sev.hasConfirmed && sev.activeConfirmed > 0);
                 const btn = $("conflicts-clear-btn");
                 if (btn) {
                     btn.addEventListener("click", async () => {

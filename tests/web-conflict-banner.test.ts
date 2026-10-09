@@ -17,8 +17,9 @@ const END_MARK = "window.bili_conflictLine = bili_conflictLine;";
 
 type LatestEntry = { kind: string; detail?: string; at?: number; sessionId?: string };
 type BannerInput = { events?: number; sessions?: number; active?: number; historical?: number; kinds?: Record<string, number>; latest?: LatestEntry[] };
-type SeverityInput = BannerInput & { sibling?: number; suspected?: number };
-interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; what: string; active: number }
+// #2545: displayOnly/activeConfirmed are additive payload fields from summarizeConflicts.
+type SeverityInput = BannerInput & { sibling?: number; suspected?: number; displayOnly?: number; activeConfirmed?: number };
+interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; neutralOnly?: boolean; what: string; active: number; activeConfirmed: number }
 
 // Both helpers share the same extracted slice (they sit together in WEB_CLIENT);
 // the slice ends at the first window.* export so no `window` reference runs under Node.
@@ -199,6 +200,68 @@ test("#2324 old payload without c.suspected degrades to the previous all-confirm
     const r = sev({ events: 96, sessions: 96, kinds: { "third-party-plugin": 96 }, active: 96 });
     assert.strictEqual(r.hasConfirmed, true);
     assert.strictEqual(r.riskKey, "conflict.risk_active");
+});
+
+// #2545: unannounced rewrites / orphan reaps are UNCONFIRMED signals — they must
+// never count as confirmed native evidence, verified read-only viewers are neutral,
+// and liveness follows the confirmed tier, not any fresh event.
+
+test("#2545 the issue's exact aggregate: rewrite ×1 + suspected inspector ×2 across 3 sessions -> unconfirmed diagnosis", () => {
+    const sev = bannerSeverity();
+    const r = sev({
+        events: 3, sessions: 3,
+        kinds: { "unannounced-rewrite": 1, "third-party-plugin": 2 },
+        sibling: 0, suspected: 2, displayOnly: 2,
+        active: 1, historical: 2, activeConfirmed: 0,
+    });
+    assert.strictEqual(r.hasConfirmed, false, "no confirmed compressor evidence in this mix");
+    assert.strictEqual(r.onKey, "conflict.on_unconfirmed");
+    assert.strictEqual(r.riskKey, "conflict.risk_unconfirmed");
+    assert.ok(r.what.length > 0, "names the observed-rewrite family");
+    assert.ok(!r.neutralOnly, "a genuine rewrite signal keeps the banner visible");
+});
+
+test("#2545 display-only-only ledger stands down completely (banner hidden via neutralOnly)", () => {
+    const sev = bannerSeverity();
+    const r = sev({ events: 2, kinds: { "third-party-plugin": 2 }, sibling: 0, suspected: 2, displayOnly: 2, active: 2 });
+    assert.strictEqual(r.hasConfirmed, false);
+    assert.strictEqual(r.siblingOnly, false, "display-only records are not siblings");
+    assert.strictEqual(r.neutralOnly, true, "verified read-only viewers are not conflicts");
+});
+
+test("#2545 a lone unannounced-rewrite was escalated to a confirmed warning before — now unconfirmed", () => {
+    const sev = bannerSeverity();
+    const r = sev({ events: 1, sessions: 1, kinds: { "unannounced-rewrite": 1 }, active: 1 });
+    assert.strictEqual(r.hasConfirmed, false);
+    assert.strictEqual(r.onKey, "conflict.on_unconfirmed");
+    assert.strictEqual(r.riskKey, "conflict.risk_unconfirmed");
+});
+
+test("#2545 stale confirmed stock + fresh unconfirmed signal -> confirmed framing graded by its own age", () => {
+    const sev = bannerSeverity();
+    const stale = sev({
+        events: 2, sessions: 2,
+        kinds: { "native-compaction": 1, "unannounced-rewrite": 1 },
+        active: 2, historical: 0, activeConfirmed: 0,
+    });
+    assert.strictEqual(stale.hasConfirmed, true, "native-compaction IS confirmed evidence");
+    assert.strictEqual(stale.riskKey, "conflict.risk_historical", "liveness follows the confirmed evidence, not the fresh signal");
+
+    const fresh = sev({
+        events: 2, sessions: 2,
+        kinds: { "native-compaction": 1, "unannounced-rewrite": 1 },
+        active: 2, historical: 0, activeConfirmed: 1,
+    });
+    assert.strictEqual(fresh.riskKey, "conflict.risk_active");
+});
+
+test("#2545 old payload without displayOnly degrades: stock suspected records keep the soft tier", () => {
+    const sev = bannerSeverity();
+    const r = sev({ events: 2, kinds: { "third-party-plugin": 2 }, suspected: 2, active: 2 });
+    assert.strictEqual(r.hasConfirmed, false);
+    assert.strictEqual(r.onKey, "conflict.on_suspected");
+    assert.strictEqual(r.riskKey, "conflict.risk_suspected");
+    assert.ok(!r.neutralOnly, "without displayOnly data the pre-#2545 soft behavior holds");
 });
 
 test("banner wiring: conflicts-banner branch renders bili_conflictLine (drift guard)", () => {

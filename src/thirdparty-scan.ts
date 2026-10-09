@@ -61,19 +61,43 @@ export function isDesignBenign(finding: ThirdPartyFinding, pluginAgent: string |
     return false;
 }
 
-/** #2261: reverse-map a recorded conflict detail back to its plugin entry so
- *  display surfaces can tell bili's OWN siblings apart from true third parties
- *  — every other surface labels the whole "third-party-plugin" kind as a
- *  foreign compressor, which mislabels first-party siblings and commands
- *  removal of extensions that stand down by design (#820/#920). Detail shape
- *  (single producer, server.ts scan site): "<client>: <entry> (<source>)[ [suspected]]".
- *  Classifying at display time (not record time) also covers stock ledgers
- *  written by older versions before any sibling tag existed. */
-export function isSiblingConflictDetail(detail: string): boolean {
+/** #2261/#2545: parse a recorded third-party-plugin conflict detail back into
+ *  its identity parts so display surfaces can classify what the record actually
+ *  names. Detail shape (single producer, server.ts scan site):
+ *  "<client>: <entry> (<source>)[ [suspected]]". Classifying at display time
+ *  (not record time) also covers stock ledgers written by older versions before
+ *  any of these tags existed. Non-plugin detail shapes (unannounced-rewrite /
+ *  orphan-reap / native-compaction) never match. */
+export interface ParsedPluginConflictDetail {
+    client: string;
+    entry: string;
+    source: string;
+    suspected: boolean;
+}
+
+export function parsePluginConflictDetail(detail: string): ParsedPluginConflictDetail | undefined {
     const m = /^(\S+): (.+) \((.+)\)( \[suspected\])?$/.exec(detail.trim());
-    if (!m) return false;
-    const entry = m[2]!;
-    return isLegacyBcpEntry(entry) || isOpencodeAcpEntry(entry);
+    if (!m) return undefined;
+    return { client: m[1]!, entry: m[2]!, source: m[3]!, suspected: m[4] !== undefined };
+}
+
+/** #2261: true when the recorded detail names bili's OWN sibling extension
+ *  (billion-context-pi / opencode-acp) — first-party family that stands down
+ *  while bili drives the session (#820/#920), never a foreign-compressor alarm. */
+export function isSiblingConflictDetail(detail: string): boolean {
+    const p = parsePluginConflictDetail(detail);
+    if (!p) return false;
+    return isLegacyBcpEntry(p.entry) || isOpencodeAcpEntry(p.entry);
+}
+
+/** #2545: true when the recorded detail names a VERIFIED read-only plugin from
+ *  KNOWN_DISPLAY_ONLY. Such records were only ever written as [suspected] by
+ *  pre-#1736 keyword rules (which matched bare "context"), and must count for
+ *  NO conflict severity on any display surface — the plugin does not compress. */
+export function isDisplayOnlyConflictDetail(detail: string): boolean {
+    const p = parsePluginConflictDetail(detail);
+    if (!p) return false;
+    return isKnownDisplayOnlyPlugin(p.entry);
 }
 
 const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -176,6 +200,12 @@ const KNOWN_DISPLAY_ONLY = new Set<string>([
     // registers display toggles; README states "changes display only" — no context
     // replacement or compression handler (#2324).
     "pi-compact-transcript",
+    // pi context viewer: read-only /context overlay showing tokens, system prompt,
+    // tools and messages; its source registers only /context and reads context/tool
+    // info — no compression or history-rewrite API (#2545). Pre-#1736 keyword rules
+    // matched its name (bare "context") and wrote stock [suspected] ledger records;
+    // isDisplayOnlyConflictDetail neutralizes those at display time.
+    "pi-context-inspector",
 ]);
 
 export function isKnownDisplayOnlyPlugin(entry: string): boolean {

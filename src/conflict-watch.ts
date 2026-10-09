@@ -11,7 +11,7 @@
 
 import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
-import { isSiblingConflictDetail } from "./thirdparty-scan.js";
+import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
 type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
 
@@ -107,13 +107,43 @@ function isSuspectedEvent(e: ConflictEvent): boolean {
     return e.kind === "third-party-plugin" && e.detail.endsWith("[suspected]");
 }
 
+// #2545: evidence tiers. NEUTRAL = records naming things that are NOT second
+// compressors by verification: bili's own siblings (stand down while bili drives
+// the session, #2261) and KNOWN_DISPLAY_ONLY read-only plugins (#2324/#2545).
+// CONFIRMED = bili identified who rewrote the conversation: a detected
+// native-compaction landing, or a plugin finding that is not name-only
+// [suspected]. UNCONFIRMED SIGNALS = observations consistent with external
+// rewriting whose CAUSE is not identified: unannounced rewrites (ref coverage
+// dropped) and orphan reaps (summarized content left the client history).
+// Severity surfaces must grade by tier — cross-session aggregate counts of
+// unconfirmed signals are NOT evidence of same-conversation double compression.
+function isNeutralEvent(e: ConflictEvent): boolean {
+    return e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail));
+}
+
+export function isConfirmedConflictEvent(e: ConflictEvent): boolean {
+    if (e.kind === "native-compaction") return true;
+    if (e.kind !== "third-party-plugin") return false;
+    return !isNeutralEvent(e) && !isSuspectedEvent(e);
+}
+
 export function formatConflictSection(events: ConflictEvent[], now: number = Date.now(), client?: string): string[] {
     const lines: string[] = [];
     // #2102: label the age split up front — an all-historical section must not
     // read as a live alarm (it previously said "two compressors ..." imperatively
     // even when every event was months old).
     const { active, historical } = splitConflictEvents(events, now);
-    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:`);
+    // #2545: tier the ledger BEFORE choosing framing — the double-compression
+    // claim in the header is only made when confirmed evidence is present.
+    const meaningful = events.filter((e) => !isNeutralEvent(e));
+    const confirmed = meaningful.filter(isConfirmedConflictEvent);
+    const foreignConfirmed = confirmed.some((e) => e.kind === "third-party-plugin");
+    const nativePresent = confirmed.some((e) => e.kind === "native-compaction");
+    const signals = meaningful.filter((e) => e.kind === "unannounced-rewrite" || e.kind === "orphan-reap");
+    const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
+    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
+        ? "Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:"
+        : "Diagnostic evidence that something outside bili touched this conversation — how strong that evidence is is tiered below:"}`);
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
@@ -124,34 +154,42 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     if (suspectedCount > 0) {
         lines.push("  [suspected] = name-only keyword match — verify the plugin actually compresses before acting; a context dashboard/viewer/tool is NOT a compressor.");
     }
-    const allSuspected = suspectedCount > 0 && suspectedCount === events.length;
-    // #2432: a ledger pointing at the client's OWN native compaction landing is
-    // not "a second compressor fighting you" — commanding the model to hunt for
-    // and disable another plugin sends it on a useless errand (the incident
-    // model did exactly that). Only foreign CONFIRMED third-party events keep
-    // the one-compressor command; suspected names never do (#1736 tiering).
-    const foreignConfirmed = events.some((e) => e.kind === "third-party-plugin" && !isSuspectedEvent(e));
-    const nativePresent = events.some((e) => e.kind === "native-compaction");
-    // #2261: a ledger naming ONLY bili's own siblings (billion-context-pi /
-    // opencode-acp) is not a foreign-compressor alarm — they stand down while
-    // bili drives the session (#820/#920), so never command removal for them.
-    const siblingEvents = events.filter((e) => e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail));
-    const siblingsOnly = siblingEvents.length > 0 && siblingEvents.length === events.length;
-    lines.push(siblingsOnly
-        ? "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp), not a third-party compressor: while bili drives the session it stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise), so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear."
-        : active.length === 0
-            ? "All events above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compression plugin is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
-            : allSuspected
-                ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
-                : nativePresent && !foreignConfirmed
-                    ? "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation."
-                    : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+    // #2545 branch ladder, first match wins:
+    //   neutral-only             -> stand-down: siblings + verified read-only viewers
+    //   foreign confirmed        -> strong one-compressor command (live) or verify-then-clear (stock)
+    //   native landing (no foreign)-> host-side explanation, no plugin hunt (#2432)
+    //   pure [suspected]         -> #1736 soft wording
+    //   unconfirmed signals      -> "cause not identified" framing, never imperative
+    let advice: string;
+    if (meaningful.length === 0) {
+        advice = "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp) or a verified read-only plugin (display-only by design): while bili drives the session the sibling stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise) and the read-only plugin does not compress anything, so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear.";
+    } else if (foreignConfirmed) {
+        advice = activeConfirmed
+            ? "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session."
+            : "The confirmed event(s) above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compression plugin is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else if (nativePresent) {
+        // #2432: a ledger pointing at the client's OWN native compaction landing is
+        // not "a second compressor fighting you" — commanding the model to hunt for
+        // and disable another plugin sends it on a useless errand (the incident
+        // model did exactly that). Only foreign CONFIRMED third-party events keep
+        // the one-compressor command; suspected names never do (#1736 tiering).
+        advice = "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation.";
+    } else if (signals.length === 0) {
+        advice = active.length > 0
+            ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
+            : "Every event above is [suspected] AND older than 7 days (historical stock): confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name. If none of them turns out to compress, clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else {
+        advice = active.length > 0
+            ? "Every event above is an UNCONFIRMED signal: history changes were observed (rewrites without a recognized compaction marker, summarized blocks leaving the client history) and/or name-only [suspected] plugin matches, but nothing here identifies WHO rewrote the conversation — the cause is not confirmed. Do not drop a read-only tool or viewer on the strength of these records; verify the named plugins and the client's auto-compaction settings before acting."
+            : "All events above are UNCONFIRMED signals older than 7 days (historical stock): history changes were observed but their cause was never identified, and no second compressor is confirmed. If the affected sessions are gone, clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    }
+    lines.push(advice);
     // #2219: actionable per-client remediation — the surfaces used to stop at
     // WHAT happened; answering HOW required digging out four separate doc
     // locations, none linked from any conflict surface. Skipped for the #2261
-    // siblings-only ledger: its footer already says no second compressor is
+    // neutral-only ledger: its footer already says no second compressor is
     // active, so a per-client fix command would contradict it.
-    if (!siblingsOnly) {
+    if (meaningful.length > 0) {
         lines.push("", `Fix${client ? ` (${client})` : ""}: ${conflictRemediation(client)}`);
         lines.push(CONFLICT_DOCS_POINTER);
     }
@@ -176,6 +214,16 @@ interface ConflictSummary {
      *  additive, so display surfaces can stop treating unverified name matches as
      *  confirmed compressors. Disjoint from `sibling` (siblings are never suspected). */
     suspected: number;
+    /** #2545: plugin-kind events naming VERIFIED read-only (display-only) plugins —
+     *  display-time classification of recorded details (stock ledgers written by pre-#1736
+     *  keyword rules carry them as [suspected]). Additive within kinds["third-party-plugin"],
+     *  disjoint from `sibling`, and OVERLAPPING `suspected` for those stock records — display
+     *  surfaces subtract it BEFORE suspected so the records count for no severity. */
+    displayOnly: number;
+    /** #2545: CONFIRMED-tier events (isConfirmedConflictEvent) within the active window —
+     *  liveness of the confirmed evidence itself, so a fresh unconfirmed signal cannot
+     *  re-light a stale confirmed ledger as a live alarm. Subset of `active`. */
+    activeConfirmed: number;
     latest: Array<{ sessionId: string; at: number; kind: ConflictKind; detail: string }>;
     /** #2219: distinct resolved clients of sessions carrying events (first-seen
      *  order) — lets the web banner show per-client remediation hints. */
@@ -183,7 +231,7 @@ interface ConflictSummary {
 }
 
 export function summarizeConflicts(sessions: Session[], now: number = Date.now()): ConflictSummary {
-    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, suspected: 0, clients: [] };
+    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, suspected: 0, displayOnly: 0, activeConfirmed: 0, clients: [] };
     for (const s of sessions) {
         const events = conflictEventsOf(s);
         if (events.length === 0) continue;
@@ -194,8 +242,11 @@ export function summarizeConflicts(sessions: Session[], now: number = Date.now()
         for (const e of events) {
             summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
             if (e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail)) summary.sibling += 1;
+            if (e.kind === "third-party-plugin" && isDisplayOnlyConflictDetail(e.detail)) summary.displayOnly += 1;
             if (isSuspectedEvent(e)) summary.suspected += 1;
-            if (now - e.at <= CONFLICT_ACTIVE_WINDOW_MS) summary.active += 1; else summary.historical += 1;
+            const isActive = now - e.at <= CONFLICT_ACTIVE_WINDOW_MS;
+            if (isActive) summary.active += 1; else summary.historical += 1;
+            if (isActive && isConfirmedConflictEvent(e)) summary.activeConfirmed += 1;
             if (summary.lastAt === null || e.at > summary.lastAt) summary.lastAt = e.at;
         }
         const last = events[events.length - 1]!;
