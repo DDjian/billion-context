@@ -159,6 +159,21 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_conflictHintBlock = conflictHintBlock;
+    // #2462: high-cost plugin notice (NOT a compression conflict). Pure builder
+    // taking pre-translated strings so the test seam needs only escapeHtml;
+    // name/url are user/plugin data -> escaped.
+    function bili_pluginAdvisoryBanner(advs, s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        for (const a of advs) {
+            const url = typeof a.issueUrl === "string" ? a.issueUrl : "";
+            html += '<div class="alert-row"><span><strong>' + escapeHtml(a.name || a.id) + "</strong> " + escapeHtml(s.desc) + "</span>";
+            if (url) html += '<a class="mono" href="' + escapeHtml(url) + '" target="_blank" rel="noopener">' + escapeHtml(url) + "</a>";
+            html += "</div>";
+        }
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_pluginAdvisoryBanner = bili_pluginAdvisoryBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -529,6 +544,19 @@ export const WEB_CLIENT = `(function () {
                 ab.hidden = true;
                 ab.classList.remove("show");
                 ab.innerHTML = "";
+            }
+        }
+        const pb = $("plugin-advisory-banner");
+        if (pb) {
+            const advs = Array.isArray(d.pluginAdvisories) ? d.pluginAdvisories : [];
+            if (advs.length > 0) {
+                pb.hidden = false;
+                pb.classList.add("show");
+                pb.innerHTML = bili_pluginAdvisoryBanner(advs, { on: t("pluginadv.on"), desc: t("pluginadv.desc"), hint: t("pluginadv.hint") });
+            } else {
+                pb.hidden = true;
+                pb.classList.remove("show");
+                pb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
