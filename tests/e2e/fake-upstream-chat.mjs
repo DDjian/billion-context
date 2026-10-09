@@ -192,6 +192,12 @@ const server = http.createServer((req, res) => {
                     ? flatContent(lastUserMsg.content).match(/\x3cacp\s+[^>]*?\x3e(m\d{5})\x3c\/acp\x3e/)
                     : null;
                 const convKey = req.headers["x-bili-plugin-conversation"] ?? "anon";
+                // #2546: user messages carrying an acp_delegate completion
+                // notification ("[acp_delegate ..." prefix — notification texts
+                // only). Lets suites assert the notification PERSISTS across
+                // requests: a request-local injection would show up in exactly
+                // one row, a persisted session message in every later one.
+                const notifCount = users.filter((u) => flatContent(u.content).replace(/\x3cacp\b[^>]*\x3e[\s\S]*?\x3c\/acp\x3e/g, "").includes("[acp_delegate")).length;
                 const reply = answerFor(convKey, firstUserText, parsed);
                 try {
                     fs.appendFileSync(REQLOG, JSON.stringify({
@@ -224,6 +230,7 @@ const server = http.createServer((req, res) => {
                         // rows route VERBATIM (no ref tags, no injected tools),
                         // so suites must not mistake them for main turns.
                         title: reply.title === true,
+                        notifCount,
                     }) + "\n");
                 } catch { /* noop */ }
                 if (parsed.stream) {

@@ -11,7 +11,6 @@ import { Type, type Static } from "typebox";
 import { delegateStatusWidget } from "./fleet-widget.js";
 import type {
   AgentToolResult,
-  ContextEvent,
   ExtensionAPI,
   ExtensionContext,
   ToolDefinition,
@@ -29,12 +28,15 @@ const RESULT_SUMMARY_CHARS = 500;
 export const OUT_DIR = join(tmpdir(), "acp-delegate");
 // Completion notifications are committed at commit boundaries, never on a
 // fixed timer (#2301): while the host is BUSY, pending runs stay revocable
-// until the `context` event (fires before every model call) re-checks them and
-// merges survivors into ONE message appended to the very context about to hit
-// the provider — no async gap between check and commit, so a result the model
-// already read/waited cannot be double-delivered. While IDLE (no model call
-// coming) ONE merged steering message starts a turn instead (#2320: a follow-
-// up parked there would wait out the whole task). Finishes landing between
+// until the next `turn_end` (fires when a turn's tool execution finishes)
+// re-checks them and merges survivors into ONE persisted steering message —
+// no async gap between check and commit, so a result the model already
+// read/waited cannot be double-delivered. While IDLE (no model call coming)
+// ONE merged steering message starts a turn instead (#2320: a follow-up parked
+// there would wait out the whole task). Both tiers send through
+// sendUserMessage(steer), so the message is written to the session and stays
+// in every later request at its position (#2546: the old request-local
+// `context` append lived in exactly one request). Finishes landing between
 // boundaries merge into that same message (#157).
 const SESSION_EXT = ".session.jsonl";
 const ACTIVITY_TAIL_CHARS = 400;
@@ -818,20 +820,28 @@ function undeliveredNotice(excludeRunId?: string): string {
   return undeliveredNoticeFrom(Array.from(runs.values()), excludeRunId);
 }
 
-// ─── Completion notifications: boundary commits (#157, #2301, #2320) ────────
-// Two delivery tiers, both read-checked AT COMMIT time (never earlier):
-//   1. BUSY host — the `context` event fires before every model call of this
-//      host (the agent loop's transformContext); the pending set is re-filtered
-//      there (waiter/consumed/read-suppression) and ONE merged notification is
-//      appended to the exact message list about to hit the provider. No await
-//      separates the final check from the real context commit, so nothing ever
-//      sits in an irrevocable host queue waiting out the task (#2301's
-//      post-commit race closed at the source; #2320's stalled follow-ups gone).
-//      Hosts whose extension surface lacks the `context` event never fire it —
-//      their pending set waits for tier 2 instead.
-//   2. IDLE host — no model call is coming, so there is no context to append
-//      to; ONE merged message goes out via sendUserMessage(steer), which starts
-//      a turn immediately.
+// ─── Completion notifications: boundary commits (#157, #2301, #2320, #2546) ─
+// Two delivery tiers, both read-checked AT COMMIT time (never earlier), both
+// sending through sendUserMessage(steer) so the notification is a PERSISTED
+// user message: pi appends it to the session and injects it into the context
+// of the next LLM call, and every later request keeps it at its position.
+// (The busy tier used to append to the `context` event's outgoing message list
+// instead — request-local by design: pi restores the original state afterward,
+// so the message lived in exactly one request and vanished from later ones,
+// dropping stateful upstream sessions off their cache and stripping the result
+// from the model's history (#2546).)
+//   1. BUSY host — `turn_end` fires when a turn's tool execution finishes,
+//      right before the agent loop drains steering for the next LLM call. The
+//      pending set is re-filtered there (waiter/consumed/read-suppression) and
+//      ONE merged steering message is queued. No await separates the final
+//      check from the enqueue, so nothing ever sits in an irrevocable host
+//      queue waiting out the task (#2301's post-commit race closed at the
+//      source; #2320's stalled follow-ups gone) and delivery timing is
+//      unchanged from the old pre-call check (next LLM call after completion).
+//      Hosts whose extension surface lacks the event never fire it — their
+//      pending set waits for tier 2 instead.
+//   2. IDLE host — no model call is coming, so there is no boundary to wait
+//      for; ONE merged steering message goes out immediately and starts a turn.
 // Delegates finishing close together share ONE message in either tier (#157).
 // Failed runs are never read-suppressed (their file holds no failure marker);
 // failures stay loud. State is scoped PER HOST INSTANCE so a session switch can
@@ -882,17 +892,20 @@ function ensureHostNotificationHandlers(pi: ExtensionAPI): void {
     if (st.activeRuns > 0) st.activeRuns -= 1;
     maybeFlushNotifications(pi);
   });
-  // Busy-tier commit point: fires before every LLM call of this host. Inert on
-  // hosts that lack the event (registration stays a harmless no-op then).
-  pi.on("context", (event: ContextEvent) => commitAtContextBoundary(st, event));
+  // Busy-tier commit point: fires when a turn's tool execution finishes on
+  // this host — before the loop drains steering for the next LLM call, so the
+  // sent steering message is injected at exactly that call. Inert on hosts
+  // that lack the event (registration stays a harmless no-op then; their
+  // pending set waits for the idle tier instead).
+  pi.on("turn_end", () => commitAtTurnEnd(pi, st));
 }
 
 /** Schedule the idle-tier flush on the next macrotask if THIS host is idle.
  *  Deferred (setTimeout 0) so the sendUserMessage-driven turn starts only after
  *  the settling finally has fully unwound, avoiding two overlapping agent runs.
  *  At most one flush is ever pending per host, so same-tick finishes coalesce
- *  into one. No-op while the host is busy: the `context` handler commits at the
- *  next model call instead. */
+ *  into one. No-op while the host is busy: the `turn_end` handler commits at
+ *  the next turn boundary instead. */
 function maybeFlushNotifications(pi: ExtensionAPI): void {
   const st = hostNotificationState(pi);
   if (st.activeRuns > 0) return;
@@ -906,7 +919,7 @@ function maybeFlushNotifications(pi: ExtensionAPI): void {
 }
 
 /** Queue a finished run's completion notification. While the host is busy the
- *  entry stays REVOCABLE until the next `context` boundary re-checks it; when
+ *  entry stays REVOCABLE until the next `turn_end` boundary re-checks it; when
  *  the host is idle an immediate deferred flush is armed (idle tier). */
 export function scheduleRunNotification(pi: ExtensionAPI, run: DelegateRun): void {
   const st = hostNotificationState(pi);
@@ -915,20 +928,21 @@ export function scheduleRunNotification(pi: ExtensionAPI, run: DelegateRun): voi
   maybeFlushNotifications(pi);
 }
 
-/** Busy-tier commit: re-check ownership of queued runs EXACTLY where the model
- *  context is being assembled (the `context` event) and, if anything survives,
- *  append ONE merged notification user message to the outgoing message list.
- *  Between the read/wait checks below and the returned array there is no await,
- *  so a result the model already claimed cannot be double-delivered (#2301).
- *  Runs dropped here reached the model another way (waiter/consumed/read-after-
- *  finish suppression). Gate: commit only when the conversation already holds an
- *  assistant message — a fresh first-turn context ([system?, user]) cannot carry
- *  pending results yet (the child was spawned by an earlier response), and
- *  refusing non-turn contexts keeps auxiliary calls from consuming the batch.
- *  When the gate fails the queue is left intact for the next boundary. */
-function commitAtContextBoundary(st: HostNotificationState, event: ContextEvent) {
-  if (st.queue.length === 0) return undefined;
-  if (!event.messages.some((m) => m.role === "assistant")) return undefined;
+/** Busy-tier commit: fires at each `turn_end` of this host — the moment a
+ *  turn's tool execution finishes and before the loop drains steering for the
+ *  next LLM call. Re-check ownership here (equally fresh as the old pre-call
+ *  check: claims can only happen inside tool execution, which ends before
+ *  turn_end) and, if anything survives, queue ONE merged notification as a
+ *  PERSISTED steering user message (#2546). The extension API enqueues it
+ *  synchronously, so by the time the loop drains steering for the next call the
+ *  message is already queued — same delivery timing as the request-local
+ *  context append this replaces, but now written to the session, so every later
+ *  request keeps it instead of dropping it. Runs dropped here reached the model
+ *  another way (waiter/consumed/read-after-finish suppression). If the send
+ *  fails, the batch stays scheduled for the next boundary (retry at the next
+ *  turn_end or the idle flush). */
+function commitAtTurnEnd(pi: ExtensionAPI, st: HostNotificationState): void {
+  if (st.queue.length === 0) return;
   const deliverable: DelegateRun[] = [];
   for (const r of st.queue) {
     r.notifyQueued = false;
@@ -943,10 +957,8 @@ function commitAtContextBoundary(st: HostNotificationState, event: ContextEvent)
     }
     deliverable.push(r);
   }
-  if (deliverable.length === 0) {
-    st.queue.length = 0;
-    return undefined;
-  }
+  st.queue.length = 0;
+  if (deliverable.length === 0) return;
   const mode = delegateDisplayUsage;
   let text: string;
   let covered: DelegateRun[] = [];
@@ -968,15 +980,37 @@ function commitAtContextBoundary(st: HostNotificationState, event: ContextEvent)
     }
     text = buildBatchText(deliverable, mode, () => true);
   }
-  for (const r of deliverable) {
-    r.injected = true; // committed synchronously below — no async window
-    if (r.usage && !r.usageReported) r.usageReported = true;
+  const send = pi.sendUserMessage;
+  let sent = false;
+  if (typeof send === "function") {
+    try {
+      // Steering, not follow-up (#2320/#2546): consumed at the next safe
+      // boundary of the current task AND persisted in the session, unlike the
+      // request-local context append this replaces.
+      send.call(pi, text, { deliverAs: "steer" });
+      sent = true;
+    } catch (err) {
+      logError("delegate", { event: "notify-turn-end-error", error: String(err), runIds: deliverable.map((r) => r.runId).join(",") });
+    }
+  } else {
+    logWarn("delegate", { event: "notify-turn-end-skipped", reason: "sendUserMessage unavailable" });
   }
-  for (const c of covered) c.injected = true;
-  st.queue.length = 0;
-  debug.event("delegate-notify-context-commit", { count: deliverable.length, failed: deliverable.filter((r) => r.status === "failed").length, runIds: deliverable.map((r) => r.runId).join(",") });
-  logInfo("delegate", { event: "notify-context-commit", count: deliverable.length });
-  return { messages: [...event.messages, { role: "user" as const, content: [{ type: "text" as const, text }], timestamp: Date.now() }] };
+  if (sent) {
+    for (const r of deliverable) r.injected = true;
+    for (const c of covered) c.injected = true;
+  }
+  for (const r of deliverable) {
+    if (r.usage && !r.usageReported && (mode === "separate" || sent)) r.usageReported = true;
+  }
+  if (!sent) {
+    // Send failed: keep the batch revocably scheduled for the next boundary.
+    for (const r of deliverable) {
+      st.queue.push(r);
+      r.notifyQueued = true;
+    }
+  }
+  debug.event("delegate-notify-turn-end-commit", { count: deliverable.length, failed: deliverable.filter((r) => r.status === "failed").length, sent, runIds: deliverable.map((r) => r.runId).join(",") });
+  logInfo("delegate", { event: "notify-turn-end-commit", count: deliverable.length, failed: deliverable.filter((r) => r.status === "failed").length, sent });
 }
 
 /** Idle-tier delivery: every undelivered terminal run of ONE host (queued +

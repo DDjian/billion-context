@@ -1,17 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  findUndeliveredRuns,
   makeDelegateTool,
   scheduleRunNotification,
   setDelegateNotifyIfRead,
 } from "../src/delegate-tool.js";
 
-// #2320 busy-tier contract: while the host is mid-task, a finished delegate's
-// notification must be committed at the NEXT MODEL CALL (the `context` event),
-// not parked until the task ends. These tests drive the host lifecycle events
-// deterministically through the same mock surface as
-// delegate-settle-notify.test.ts, plus the `context` event that carries the
-// outgoing message list.
+// #2546 busy-tier contract: while the host is mid-task, a finished delegate's
+// notification must be committed at the next TURN BOUNDARY (the `turn_end`
+// event — right before the agent loop drains steering for the next model call)
+// as a PERSISTED steering user message: pi writes it to the session and every
+// later request keeps it. It must not park until the task ends (#2320) and it
+// must not ride request-locally on one outgoing message list (the old `context`
+// append vanished from later requests, breaking stateful upstream sessions).
+// These tests drive the host lifecycle events deterministically through the
+// same mock surface as delegate-settle-notify.test.ts.
 
 type PiLike = Parameters<typeof makeDelegateTool>[0];
 
@@ -29,18 +33,18 @@ function mkRun(runId: string, status: "completed" | "failed", over: Record<strin
   };
 }
 
-const assistantMsg = { role: "assistant", content: [{ type: "text", text: "working" }] } as any;
-const userMsg = { role: "user", content: [{ type: "text", text: "go" }] } as any;
-
 type SentEntry = { t: string; o?: { deliverAs?: string } };
 
-/** Mock ExtensionAPI capturing sends WITH options and able to fire the `context`
- *  event with a chosen outgoing message list. */
-function mockPi() {
+/** Mock ExtensionAPI capturing sends WITH options and able to fire lifecycle
+ *  events. `sendImpl` overrides the default capture for failure-path tests. */
+function mockPi(sendImpl?: (t: string, o?: { deliverAs?: string }, sent: SentEntry[]) => void) {
   const sent: SentEntry[] = [];
   const handlers = new Map<string, Array<(...a: unknown[]) => void>>();
   const pi = {
-    sendUserMessage: (t: string, o?: { deliverAs?: string }) => void sent.push({ t, o }),
+    sendUserMessage: (t: string, o?: { deliverAs?: string }) => {
+      if (sendImpl) sendImpl(t, o, sent);
+      else sent.push({ t, o });
+    },
     on: (event: string, handler: (...a: unknown[]) => void) => {
       const list = handlers.get(event) ?? [];
       list.push(handler);
@@ -50,16 +54,7 @@ function mockPi() {
   const emit = (event: string) => {
     for (const h of handlers.get(event) ?? []) h({});
   };
-  // Fire the context boundary; returns the handler's ContextEventResult (if any).
-  const context = (messages: unknown[]): unknown => {
-    let res: unknown;
-    for (const h of handlers.get("context") ?? []) {
-      const r = h({ type: "context", messages });
-      if (r !== undefined) res = r;
-    }
-    return res;
-  };
-  return { pi, sent, emit, context };
+  return { pi, sent, emit };
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -71,45 +66,43 @@ async function waitFor(cond: () => boolean, what: string, ms = 1000): Promise<vo
   }
 }
 
-// ─── busy tier: commit at the next model call, mid-task ─────────────────────
+// ─── busy tier: commit at the next turn boundary, mid-task ──────────────────
 
-test("busy host: notification commits into the next model call's context (#2320)", async () => {
+test("busy host: notification commits as a persisted steering message at the next turn_end (#2546)", async () => {
   setDelegateNotifyIfRead("skip");
-  const { pi, sent, emit, context } = mockPi();
+  const { pi, sent, emit } = mockPi();
   makeDelegateTool(pi);
   emit("agent_start"); // host is mid-task
   const run = mkRun("del_busy", "completed");
   scheduleRunNotification(pi, run);
   await sleep(30);
-  assert.equal(sent.length, 0, "nothing sent while the host is busy");
+  assert.equal(sent.length, 0, "nothing sent before a turn boundary");
 
-  // The next LLM call assembles the context — the notification must ride along.
-  const base = [assistantMsg, userMsg];
-  const res = context(base) as { messages: unknown[] } | undefined;
-  assert.ok(res, "context handler returns modified messages");
-  assert.equal(res.messages.length, base.length + 1, "exactly ONE message appended");
-  const appended = res.messages[base.length]! as any;
-  assert.equal(appended.role, "user");
-  assert.ok(String(appended.content[0]!.text).includes("`del_busy`"), "names the run");
-  assert.equal(run.injected, true, "marked committed synchronously");
+  // The current turn's tool execution finishes — the notification must go out
+  // as a steering message that pi persists into the session.
+  emit("turn_end");
+  assert.equal(sent.length, 1, "exactly ONE message committed at the boundary");
+  assert.deepEqual(sent[0]!.o, { deliverAs: "steer" }, "persisted steering delivery");
+  assert.ok(sent[0]!.t.includes("`del_busy`"), "names the run");
+  assert.equal(run.injected, true, "marked delivered on successful send");
   assert.equal(run.notifyQueued, false);
 
   // Task ends shortly after: nothing may be delivered AGAIN.
   emit("agent_settled");
   await sleep(30);
-  assert.equal(sent.length, 0, "no double delivery at the settle boundary");
+  assert.equal(sent.length, 1, "no double delivery at the settle boundary");
 });
 
 test("busy host: read-before-boundary drops the notification at commit time (#2301)", async () => {
   setDelegateNotifyIfRead("skip");
-  const { pi, sent, emit, context } = mockPi();
+  const { pi, sent, emit } = mockPi();
   makeDelegateTool(pi);
   emit("agent_start");
-  const run = mkRun("del_ctx_read", "completed");
+  const run = mkRun("del_te_read", "completed");
   scheduleRunNotification(pi, run);
   run.readAt = run.finishedAt; // model claims the result before the boundary
-  const res = context([assistantMsg, userMsg]);
-  assert.equal(res, undefined, "nothing survives the re-check -> unmodified context");
+  emit("turn_end");
+  assert.equal(sent.length, 0, "nothing survives the re-check -> nothing sent");
   assert.equal(run.readSuppressed, true, "recorded as suppressed");
   assert.equal(run.injected, true, "suppression marks it handled so no tier can deliver it");
   emit("agent_settled");
@@ -119,63 +112,87 @@ test("busy host: read-before-boundary drops the notification at commit time (#23
 
 test("busy host: failed run commits even when its output was read", async () => {
   setDelegateNotifyIfRead("skip");
-  const { pi, emit, context } = mockPi();
+  const { pi, sent, emit } = mockPi();
   makeDelegateTool(pi);
   emit("agent_start");
-  const run = mkRun("del_ctx_fail", "failed");
+  const run = mkRun("del_te_fail", "failed");
   scheduleRunNotification(pi, run);
   run.readAt = run.finishedAt;
-  const res = context([assistantMsg, userMsg]) as { messages: unknown[] };
-  const appended = res.messages[res.messages.length - 1] as any;
-  assert.match(String(appended.content[0]!.text), /FAILED/, "failures stay loud");
+  emit("turn_end");
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]!.t, /FAILED/, "failures stay loud");
   assert.equal(run.readSuppressed, undefined);
 });
 
-test("busy host: close-together finishes merge into ONE appended message", async () => {
-  const { pi, emit, context } = mockPi();
+test("busy host: close-together finishes merge into ONE steering message", async () => {
+  const { pi, sent, emit } = mockPi();
   makeDelegateTool(pi);
   emit("agent_start");
   const a = mkRun("del_m1", "completed");
   const b = mkRun("del_m2", "failed");
   scheduleRunNotification(pi, a);
   scheduleRunNotification(pi, b);
-  const base = [assistantMsg, userMsg];
-  const res = context(base) as { messages: unknown[] };
-  assert.equal(res.messages.length, base.length + 1, "one merged message, not two");
-  const text = String((res.messages[base.length] as any).content[0]!.text);
-  assert.ok(text.includes("`del_m1`") && text.includes("`del_m2`"), "both runs named");
-  assert.ok(text.includes("2 delegates finished"), "batch header");
+  emit("turn_end");
+  assert.equal(sent.length, 1, "one merged message, not two");
+  assert.ok(sent[0]!.t.includes("`del_m1`") && sent[0]!.t.includes("`del_m2`"), "both runs named");
+  assert.ok(sent[0]!.t.includes("2 delegates finished"), "batch header");
   assert.equal(a.injected, true);
   assert.equal(b.injected, true);
 });
 
-test("busy host: non-turn contexts (no assistant yet) defer the commit", async () => {
-  const { pi, emit, context } = mockPi();
+test("busy host: a run finishing after one boundary commits at the NEXT turn_end", async () => {
+  const { pi, sent, emit } = mockPi();
   makeDelegateTool(pi);
   emit("agent_start");
-  const run = mkRun("del_gate", "completed");
-  scheduleRunNotification(pi, run);
-  const res = context([userMsg]); // e.g. an auxiliary/first-turn context
-  assert.equal(res, undefined, "gate refuses a context with no assistant turn");
-  assert.equal(run.notifyQueued, true, "still pending for the next boundary");
-  const res2 = context([assistantMsg, userMsg]) as { messages: unknown[] };
-  assert.ok(res2, "the real turn's context picks it up");
-  assert.equal(run.injected, true);
+  const a = mkRun("del_seq_a", "completed");
+  scheduleRunNotification(pi, a);
+  emit("turn_end");
+  assert.equal(sent.length, 1, "first run commits at its boundary");
+  assert.ok(!sent[0]!.t.includes("`del_seq_b`"));
+
+  const b = mkRun("del_seq_b", "completed");
+  scheduleRunNotification(pi, b);
+  await sleep(30);
+  assert.equal(sent.length, 1, "still busy: no commit before the next boundary");
+  emit("turn_end");
+  assert.equal(sent.length, 2, "second run commits at the next boundary");
+  assert.ok(sent[1]!.t.includes("`del_seq_b`"));
+  assert.equal(b.injected, true);
 });
 
 test("busy host: waiter-owned runs are excluded from the boundary commit", async () => {
-  const { pi, emit, context } = mockPi();
+  const { pi, sent, emit } = mockPi();
   makeDelegateTool(pi);
   emit("agent_start");
   const parked = mkRun("del_parked", "completed", { waiter: {} });
   const free = mkRun("del_free", "completed");
   scheduleRunNotification(pi, parked);
   scheduleRunNotification(pi, free);
-  const res = context([assistantMsg, userMsg]) as { messages: unknown[] };
-  const text = String((res.messages[res.messages.length - 1] as any).content[0]!.text);
-  assert.ok(text.includes("`del_free`"));
-  assert.ok(!text.includes("`del_parked`"), "wait-owned result stays with the wait path");
+  emit("turn_end");
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0]!.t.includes("`del_free`"));
+  assert.ok(!sent[0]!.t.includes("`del_parked`"), "wait-owned result stays with the wait path");
   assert.ok(!parked.injected, "waiter run untouched — the wait path owns its delivery");
+});
+
+test("busy host: send failure keeps the batch scheduled for the next boundary", async () => {
+  const { pi, sent, emit } = mockPi((t, o, s) => {
+    throw new Error("host rejected the message");
+  });
+  makeDelegateTool(pi);
+  emit("agent_start");
+  const run = mkRun("del_sendfail", "completed");
+  scheduleRunNotification(pi, run);
+  await sleep(30);
+  emit("turn_end");
+  assert.equal(sent.length, 0, "failed send delivers nothing");
+  assert.equal(run.injected, undefined, "not marked delivered");
+  assert.equal(run.notifyQueued, true, "still scheduled for retry");
+  emit("agent_settled");
+  await sleep(30);
+  assert.equal(sent.length, 0, "the idle flush fails against the same broken sender too");
+  assert.equal(run.injected, undefined, "a failed flush never marks delivered");
+  assert.equal(findUndeliveredRuns([run]).length, 1, "recovery stays available via the undelivered-notice path");
 });
 
 // ─── per-host isolation: sessions never leak notifications across hosts ─────
@@ -195,16 +212,16 @@ test("two hosts: each boundary commits only its own queued runs", async () => {
   assert.equal(A.sent.length, 0);
   assert.equal(B.sent.length, 0);
 
-  const resA = A.context([assistantMsg, userMsg]) as { messages: unknown[] };
-  const textA = String((resA.messages[resA.messages.length - 1] as any).content[0]!.text);
-  assert.ok(textA.includes("`del_hostA`"));
-  assert.ok(!textA.includes("`del_hostB`"), "host A's context never sees host B's run");
+  A.emit("turn_end");
+  assert.equal(A.sent.length, 1);
+  assert.ok(A.sent[0]!.t.includes("`del_hostA`"));
+  assert.ok(!A.sent[0]!.t.includes("`del_hostB`"), "host A never sees host B's run");
   assert.equal(rb.notifyQueued, true, "host B's run still pending");
 
-  const resB = B.context([assistantMsg, userMsg]) as { messages: unknown[] };
-  const textB = String((resB.messages[resB.messages.length - 1] as any).content[0]!.text);
-  assert.ok(textB.includes("`del_hostB`"));
-  assert.ok(!textB.includes("`del_hostA`"));
+  B.emit("turn_end");
+  assert.equal(B.sent.length, 1);
+  assert.ok(B.sent[0]!.t.includes("`del_hostB`"));
+  assert.ok(!B.sent[0]!.t.includes("`del_hostA`"));
 });
 
 // ─── idle tier: ONE merged steering message starts the follow-up turn ───────
