@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { dshProfileDirs } from "./dsh-channel.js";
 
-export interface CostAdvisory {
+interface CostAdvisory {
     id: string;
     name: string;
     client: string;
