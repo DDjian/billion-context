@@ -229,8 +229,8 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    partially-set object still resolves fully. Absent leaves
   *    `base.nudge.tierGrowthTokens` untouched.
  *  - `preserveRecentMessages` / `preserveRecentTokens` → top-level Config.
-   *  - `minCompressRange` (deprecated alias: `minCompressRangeChars`) →
-   *    `compress.minCompressRange`. The unit is tokens.
+  *  - `minCompressRange` (deprecated alias: `minCompressRangeChars`) →
+  *    `compress.minCompressRange`. The unit is tokens.
   *  - `tiers` → `tiers.enabled`.
   *  - `protectedLatestTools` → top-level Config (kernel hard-excludes the
   *    latest instance + paired result of matching tools from every compress
