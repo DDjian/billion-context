@@ -160,7 +160,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, absorbArmed?: boolean): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, clientCacheControls?: Map<string, unknown>, absorbArmed?: boolean): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -260,7 +260,11 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // marks through the SAME kernel applier as the steady path
             // (coreToAnthropic) — a marker present on the trigger turn must be
             // present here too or the byte prefix breaks at that element.
-            const messages = coreToAnthropic(coreMessages, cacheMarks);
+            // #2499: fall back to the CLIENT's harvested marks exactly as the
+            // steady path does (`anthropicCacheMarks ?? cacheControls`) — a
+            // client-managed session has no bili marks, and dropping its
+            // breakpoint leaves the post-fold prefix unwritten to cache.
+            const messages = coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls);
             // #1876: same append-not-merge rebuild as the steady path's
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
