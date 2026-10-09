@@ -51,13 +51,25 @@ async function withHealthServer<T>(fn: (origin: string) => Promise<T>): Promise<
     }
 }
 
-async function deadOrigin(): Promise<string> {
-    const server = http.createServer();
+// #2548/#1689: a released port can be rebound by any parallel process before
+// the consumer acts, so a "dead" origin could answer healthy and flip the
+// expected refusal into an active attach. Keep a LIVE server bound for the whole
+// test that answers 500 — probeProxyHealth judges a 500 answer unhealthy — so the
+// expectation is constructed, not assumed: the race is closed, not narrowed.
+async function withUnhealthyOrigin<T>(fn: (origin: string) => Promise<T>): Promise<T> {
+    const server = http.createServer((_req, res) => {
+        res.writeHead(500);
+        res.end();
+    });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     const addr = server.address();
     if (addr === null || typeof addr === "string") throw new Error("no port");
-    await new Promise<void>((r) => server.close(() => r()));
-    return `http://127.0.0.1:${addr.port}`;
+    try {
+        return await fn(`http://127.0.0.1:${addr.port}`);
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
 }
 
 test("planNativeZcode resolves kill-switches > attach > spawn", () => {
@@ -78,7 +90,9 @@ test("probeProxyHealth accepts any live proxy answer and rejects failures", asyn
     await withHealthServer(async (origin) => {
         assert.equal(await probeProxyHealth(origin), true);
     });
-    assert.equal(await probeProxyHealth(await deadOrigin()), false);
+    await withUnhealthyOrigin(async (origin) => {
+        assert.equal(await probeProxyHealth(origin), false);
+    });
     const bad = http.createServer((_req, res) => {
         res.writeHead(500, { "content-type": "application/json" });
         res.end('{"ok":true}');
@@ -218,11 +232,12 @@ test("bootstrapZcodeNative attaches to a healthy proxy and routes", async () => 
 test("bootstrapZcodeNative fails closed on an unhealthy attach target", async () => {
     const dir = dataDir();
     try {
-        const origin = await deadOrigin();
-        await assert.rejects(
-            bootstrapZcodeNative({ env: { BILLION_CONTEXT_ATTACH: origin }, dataDir: dir, log: () => {}, healthDeadlineMs: 300 }),
-            /not healthy/,
-        );
+        await withUnhealthyOrigin(async (origin) => {
+            await assert.rejects(
+                bootstrapZcodeNative({ env: { BILLION_CONTEXT_ATTACH: origin }, dataDir: dir, log: () => {}, healthDeadlineMs: 300 }),
+                /not healthy/,
+            );
+        });
     } finally {
         rmrf(dir);
     }
@@ -541,10 +556,11 @@ test("repairSharedStoreDrift repoints a dead foreign pointer at the healthy self
     await withHealthServer(async (selfOrigin) => {
         const dir = dataDir();
         try {
-            const dead = await deadOrigin();
-            await routeZcodeConfig({ origin: dead, dataDir: dir, log: NO_LOG });
-            assert.equal(await repairSharedStoreDrift({ selfOrigin, dataDir: dir, log: NO_LOG }), "repointed-self");
-            assert.equal(detectCurrentZcodeOrigin(dir), selfOrigin);
+            await withUnhealthyOrigin(async (dead) => {
+                await routeZcodeConfig({ origin: dead, dataDir: dir, log: NO_LOG });
+                assert.equal(await repairSharedStoreDrift({ selfOrigin, dataDir: dir, log: NO_LOG }), "repointed-self");
+                assert.equal(detectCurrentZcodeOrigin(dir), selfOrigin);
+            });
         } finally {
             rmrf(dir);
         }
