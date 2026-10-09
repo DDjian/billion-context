@@ -2061,6 +2061,66 @@ Two compressors on one conversation double-compress and corrupt message refs, so
 - **Where findings surface:** launcher stderr before the client starts; a proxy warn log on each session's first request (client identified from the `x-bili-plugin` header or wire headers); and the session's conflict ledger — `acp_status`'s `COMPRESSION CONFLICTS` section, `GET /__bili/stats` → `conflicts`, web-UI banner.
 - **Runtime evidence:** unannounced history rewrites (#1001) and orphan-gc deactivations (summarized content deleted out of the client's history) are recorded in the same ledger, so *suspected* coexistence and *observed* interference cross-check each other.
 - **dsh's `auto: false` disables only the automatic triggers.** The `compaction-basic: { auto: false }` line installed by the profile bundle patch (`dsh.bundle.patch.yml`) skips pressure/overflow auto-compaction — a manual `/compact` (and idle-session compaction) still fires. Calls routed through bili are refused by the server-side guard (#1729/#2360); calls that reach the provider without transiting bili (desktop-lane paths the plugin's takeover gate does not attribute) land, and bili detects them on the next replay — checkpoint framing + decimated fold coverage — rebasing its compression state in one turn instead of failing every later compress forever (#2432).
+
+#### Turning dsh native auto-compaction OFF in a web profile (#1772/#2474)
+
+The bundled `dsh.bundle.patch.yml` cannot do this: in a profile bundling `@deepseek-ai/dsh-web-app` its `- id: compaction-basic` row lands on web-app's **host-plane row, which is already `disabled: true`**, while the instance that actually runs lives inside `preset-standard.config.plugins`. The patch applies silently and changes nothing.
+
+A profile-layer patch **can** turn it off — presets are ordinary top-level rows inserted by the bundle layer, and the profile patch layer is applied after it. What does not work is addressing the nested row by id; what does work is overriding the preset row's `config` wholesale.
+
+**Recipe** (verified on dsh `0.2.1-alpha.1`, Windows 11, profile bundles including `@deepseek-ai/dsh-web-app`):
+
+```bash
+# 1. Dump the composed profile and copy preset-standard's COMPLETE config block.
+dsh --profile <name> --dump-config > /tmp/profile.yml
+```
+
+2. Append a `preset-standard` row to `$DSH_HOME/profiles/<name>/cordis.patch.yml` containing that **complete** `config` — every one of its `plugins` entries, byte-for-byte — with exactly one change: add `config: { auto: false }` under the `compaction-basic` row inside the `compaction` group.
+
+```yaml
+- id: preset-standard
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: standard
+    order: 1
+    plugins:
+      # … every entry from the dump, unchanged …
+      - id: compaction
+        name: cordis:group
+        group: true
+        isolate:
+          compaction: true
+          toolResultPruner: true
+        config:
+          - id: compaction-basic
+            name: '@deepseek-ai/dsh-compaction-basic'
+            config:
+              auto: false            # ← the only delta
+          - id: command-compact
+            name: '@deepseek-ai/dsh-command-compact'
+          - id: tool-result-pruner
+            name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+            config:
+              thresholdChars: 8192
+              headChars: 4096
+              tailChars: 1024
+      # … every remaining entry, unchanged …
+```
+
+3. Confirm before relying on it: `dsh --profile <name> --dump-config | grep -A2 'id: compaction-basic'` — the entry count of `preset-standard` must be **unchanged** and the nested row must now carry `config.auto: false`.
+
+Automatic pressure/overflow compaction is off; manual `/compact` and the tool-result pruner stay on. Repeat the same shape for `preset-ptc` / `preset-cordis` if sessions use those presets (`preset-minimal` ships no `compaction` group).
+
+**Three ways to get this wrong — all silent** (measured against the same dump):
+
+| Patch form | Result |
+|---|---|
+| `- id: preset-standard.compaction.compaction-basic` | `patch: entry "…" not found`; **no effect** |
+| `- id: preset-standard` + a partial `config.plugins` | `config` is **replaced, not merged** — the preset collapses to just the entries you wrote (35 → 3 in the measured case): no persona, no tools |
+| `- insert:` with `id: preset-standard` | appends a **second** `preset-standard` row at the tree tail; the live preset is untouched |
+| full `config` snapshot + one `auto: false` | ✅ entry count unchanged, only delta is `auto: false` |
+
+Because a partial override fails without any diagnostic, always re-dump and compare entry counts after editing.
 - Under the opencode launcher/native mode a present `opencode-acp` is info-only by design (#920 absorbs it for legacy sessions); everywhere else it warns.
 - Disable: `BILI_CONFLICT_SCAN=0`.
 
