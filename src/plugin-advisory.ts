@@ -7,6 +7,14 @@
 // the client registry (best-effort, read-only, cached) so the web UI surfaces a
 // notice pointing at the owning issue instead of silently burning cache. Every
 // fs access is guarded — detection must NEVER fail a request or a page load.
+//
+// Detection keys off whether the plugin is actually ENABLED, not merely
+// installed: a dsh plugin turns on when its loader id appears as a top-level
+// entry in the profile's cordis.patch.yml (the same file dsh-channel.ts treats
+// as the id-targeted override/disable/insert layer). Presence in package.json
+// deps is NOT a reliable on/off signal — the plugin usually arrives through a
+// bundle rather than a direct dep, and installed-but-disabled would be a false
+// alarm — so we scan the patch layer instead.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -22,48 +30,56 @@ interface CostAdvisory {
 const DSH_AUTO_REVIEW_ISSUE = "https://github.com/ranxianglei/billion-context/issues/2462";
 
 // One entry per known cost-affecting plugin. `client` scopes which registry to
-// scan, `id` is the exact package name (grep-able by the user), `issueUrl` is
-// the owning issue the web banner links to.
-const KNOWN_COST_PLUGINS: ReadonlyArray<{ client: string; id: string; name: string; issueUrl: string }> = [
-    { client: "dsh", id: "@deepseek-ai/dsh-experimental-auto-review", name: "@deepseek-ai/dsh-experimental-auto-review", issueUrl: DSH_AUTO_REVIEW_ISSUE },
+// scan, `id`/`name` is the npm package name (grep-able by the user), `patchIds`
+// are the dsh loader ids whose presence in cordis.patch.yml means the plugin is
+// turned ON, and `issueUrl` is the owning issue the web banner links to.
+const KNOWN_COST_PLUGINS: ReadonlyArray<{ client: string; id: string; name: string; issueUrl: string; patchIds: readonly string[] }> = [
+    { client: "dsh", id: "@deepseek-ai/dsh-experimental-auto-review", name: "@deepseek-ai/dsh-experimental-auto-review", issueUrl: DSH_AUTO_REVIEW_ISSUE, patchIds: ["auto-review"] },
 ];
 
 const SCAN_TTL_MS = 5 * 60 * 1000;
 let cache: { key: string; at: number; result: CostAdvisory[] } | undefined;
 
-function dshDependencyNames(env: NodeJS.ProcessEnv): Set<string> {
-    const names = new Set<string>();
+// Top-level "- id: <value>" patch entries across every dsh profile's
+// cordis.patch.yml. `\S+` stops at whitespace so trailing config/comments are
+// naturally excluded; surrounding quotes are stripped. Per-line and forgiving —
+// a malformed line simply yields no id.
+function dshEnabledPatchIds(env: NodeJS.ProcessEnv): Set<string> {
+    const ids = new Set<string>();
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
-        return names;
+        return ids;
     }
+    const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
     for (const dir of dirs) {
-        const file = path.join(dir, "package.json");
-        let obj: Record<string, unknown>;
+        let text: string;
         try {
-            obj = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+            text = fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8");
         } catch {
             continue;
         }
-        for (const key of ["dependencies", "devDependencies"]) {
-            const deps = obj[key];
-            if (!deps || typeof deps !== "object" || Array.isArray(deps)) continue;
-            for (const dep of Object.keys(deps as Record<string, unknown>)) names.add(dep);
+        for (const line of text.split(/\r?\n/)) {
+            const m = line.match(itemRe);
+            if (!m) continue;
+            let v = m[1];
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+            v = v.trim();
+            if (v.length > 0) ids.add(v);
         }
     }
-    return names;
+    return ids;
 }
 
 export function detectCostAdvisories(env: NodeJS.ProcessEnv = process.env): CostAdvisory[] {
     const key = `${env.DSH_HOME ?? ""}|${env.HOME ?? ""}|${env.USERPROFILE ?? ""}`;
     if (cache && cache.key === key && Date.now() - cache.at < SCAN_TTL_MS) return cache.result;
     const found: CostAdvisory[] = [];
-    const dshDeps = KNOWN_COST_PLUGINS.some((p) => p.client === "dsh") ? dshDependencyNames(env) : undefined;
+    const enabled = KNOWN_COST_PLUGINS.some((p) => p.client === "dsh") ? dshEnabledPatchIds(env) : undefined;
     for (const p of KNOWN_COST_PLUGINS) {
         if (p.client !== "dsh") continue;
-        if (!dshDeps?.has(p.id)) continue;
+        if (!p.patchIds.some((pid) => enabled?.has(pid))) continue;
         found.push({ id: p.id, name: p.name, client: p.client, issueUrl: p.issueUrl });
     }
     cache = { key, at: Date.now(), result: found };

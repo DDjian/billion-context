@@ -2,6 +2,9 @@
 // web notice that surfaces it. Distinct from the compression-conflict ledger —
 // these plugins are not compressors; they burn prefix-cache hits host-side and
 // bili already isolates them into a sub-session.
+// Detection keys off ENABLEMENT, not installation: the advisory fires only when
+// the dsh loader id (`auto-review`) appears as a top-level entry in cordis.patch.yml —
+// mere presence in package.json deps must NOT trigger it (installed-but-off / bundled).
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -16,6 +19,7 @@ import { detectCostAdvisories, _clearCostAdvisoryCache } from "../src/plugin-adv
 import { WEB_CLIENT } from "../src/web/client.ts";
 
 const PLUGIN = "@deepseek-ai/dsh-experimental-auto-review";
+const PATCH_ID = "auto-review";
 const ISSUE_URL = "https://github.com/ranxianglei/billion-context/issues/2462";
 
 function tmp(prefix: string): string {
@@ -29,6 +33,12 @@ function assertTestOwned(file: string, root: string): void {
     assert.ok(!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`),
         `refusing to write outside test-owned root ${root}: ${file}`);
 }
+function writeProfilePatch(root: string, profile: string, ids: string[]): void {
+    const file = path.join(root, "dsh", "profiles", profile, "cordis.patch.yml");
+    assertTestOwned(file, root);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [ ...ids.map((id) => `- id: ${id}`), "" ].join("\n"));
+}
 function writeProfilePkg(root: string, pkg: Record<string, unknown>): void {
     const file = path.join(root, "dsh", "profiles", "main", "package.json");
     assertTestOwned(file, root);
@@ -36,10 +46,10 @@ function writeProfilePkg(root: string, pkg: Record<string, unknown>): void {
     fs.writeFileSync(file, JSON.stringify(pkg));
 }
 
-test("#2462: dsh profile carrying auto-review yields exactly one cost advisory", () => {
+test("#2462: enabling auto-review in cordis.patch.yml yields exactly one cost advisory", () => {
     _clearCostAdvisoryCache();
     const root = tmp("bili-2462-hit-");
-    writeProfilePkg(root, { dependencies: { [PLUGIN]: "0.2.0-rc.2", "billion-context": "^0.1.0" } });
+    writeProfilePatch(root, "main", ["llm-pi-ai", "agent-default-model", PATCH_ID]);
     const res = detectCostAdvisories(hermeticEnv(root));
     assert.equal(res.length, 1);
     assert.equal(res[0]?.id, PLUGIN);
@@ -47,34 +57,66 @@ test("#2462: dsh profile carrying auto-review yields exactly one cost advisory",
     assert.equal(res[0]?.issueUrl, ISSUE_URL);
 });
 
-test("#2462: profile without the plugin yields no advisory (bili-self skipped)", () => {
+test("#2462: installed-but-NOT-enabled yields no advisory (the core gate)", () => {
     _clearCostAdvisoryCache();
-    const root = tmp("bili-2462-miss-");
-    writeProfilePkg(root, { dependencies: { "billion-context": "^0.1.0", "@deepseek-ai/dsh-compaction-basic": "0.2.0-rc.2" } });
+    const root = tmp("bili-2462-installed-off-");
+    writeProfilePkg(root, { dependencies: { [PLUGIN]: "0.2.0-rc.2", "billion-context": "^0.1.0" } });
+    writeProfilePatch(root, "main", ["llm-pi-ai", "agent-default-model"]);
     assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
 });
 
-test("#2462: missing profiles root yields empty without throwing", () => {
+test("#2462: enabled via a bundle (no direct dep in package.json) still reports", () => {
     _clearCostAdvisoryCache();
-    const root = tmp("bili-2462-empty-");
-    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
-});
-
-test("#2462: devDependencies are scanned too", () => {
-    _clearCostAdvisoryCache();
-    const root = tmp("bili-2462-dev-");
-    writeProfilePkg(root, { dependencies: {}, devDependencies: { [PLUGIN]: "*" } });
+    const root = tmp("bili-2462-bundle-");
+    writeProfilePkg(root, { dependencies: { "billion-context": "^0.1.0" }, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base"] } } });
+    writeProfilePatch(root, "main", [PATCH_ID]);
     const res = detectCostAdvisories(hermeticEnv(root));
     assert.equal(res.length, 1);
     assert.equal(res[0]?.id, PLUGIN);
 });
 
+test("#2462: other loader ids without auto-review yield no advisory", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-2462-miss-");
+    writeProfilePatch(root, "main", ["llm-pi-ai", "agent-default-model"]);
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
+});
+
+test("#2462: missing profiles root / missing patch file yield empty without throwing", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-2462-empty-");
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
+    const root2 = tmp("bili-2462-nopatch-");
+    writeProfilePkg(root2, { dependencies: {} });
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root2)), []);
+});
+
+test("#2462: quoted and commented patch ids are recognised", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-2462-quoted-");
+    const file = path.join(root, "dsh", "profiles", "main", "cordis.patch.yml");
+    assertTestOwned(file, root);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '- id: "auto-review"   # turned on\n');
+    const res = detectCostAdvisories(hermeticEnv(root));
+    assert.equal(res.length, 1);
+    assert.equal(res[0]?.id, PLUGIN);
+});
+
+test("#2462: multiple profiles enabling the same plugin report once", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-2462-multi-");
+    writeProfilePatch(root, "a", [PATCH_ID]);
+    writeProfilePatch(root, "b", [PATCH_ID]);
+    assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
+});
+
 test("#2462: result cached within TTL, invalidated by _clearCostAdvisoryCache", () => {
     _clearCostAdvisoryCache();
     const root = tmp("bili-2462-cache-");
-    writeProfilePkg(root, { dependencies: { [PLUGIN]: "x" } });
+    writeProfilePatch(root, "main", [PATCH_ID]);
     assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
-    fs.rmSync(path.join(root, "dsh", "profiles", "main", "package.json"));
+    fs.rmSync(path.join(root, "dsh", "profiles", "main", "cordis.patch.yml"));
     assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1, "cached result returned before TTL expires");
     _clearCostAdvisoryCache();
     assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), [], "after clearing the cache the re-scan sees the removal");
