@@ -7,7 +7,11 @@ review; sibling document to `SESSION-IDENTITY.md` (which settles the same
 question at session granularity). Implementation anchors:
 `acp-kernel/src/wire/message-id.ts` (`deriveMessageId`),
 `acp-kernel/src/refs.ts` (`assignRefs`), `acp-kernel/src/prune.ts`
-(`isCovered`/`baseIdOf`).
+(`isCovered`/`baseIdOf`). #2480 later split the question in two: the
+**kernel ledger** below stays content-hash, while the **fold-coverage
+re-anchoring layer** (`src/fold-reconcile.ts`) became positional-with-a-
+self-stored-canonical-copy — see “The fold-coverage layer goes positional”
+below; nothing in this document's ledger contract changed.
 
 ## The question is the join key, not the id
 
@@ -119,6 +123,53 @@ the proxy. The #2396 workaround (rewrite `call_id` + `call_output.call_id`
 together from the authoritative stored history before proxy processing) is
 the reference implementation of that duty.
 
+#2480 later dissolved the detection-only stance for this class: the missing
+piece was **host knowledge of what the bytes used to be**, and the
+fold-coverage layer now keeps exactly that — a self-stored canonical copy
+(see next section). Position supplies the pairing, the stored fingerprint
+verifies it, so claiming across a host-rewritten id scheme is no longer a
+guess. The drift log and the honest re-entry fallback both remain for the
+cases the copy cannot cover (structural edits, beyond-window history).
+
+## The fold-coverage layer goes positional (#2480)
+
+The kernel ledger and the fold-coverage re-anchor answer different
+questions:
+
+- **Ledger join** (turn N+1, re-pin `mNNNNN` onto the re-serialized array):
+  content hash, unchanged, per everything above.
+- **Fold-coverage re-anchor** (which inbound messages are the ones my
+  compression blocks already cover?): `src/fold-reconcile.ts` now answers
+  this by **position plus a self-stored canonical copy**, ahead of the
+toolCallId and normalized-content passes it already had.
+
+Mechanics: every reconcile pass rolls `foldPositions` — per-position
+`sha256-16` of `role | toolName | canonical text` (JSON-shaped text is
+key-sorted and compacted; prose keeps raw bytes; `toolCallId` and the
+`contentType` literal are excluded because they are exactly the tokens that
+re-encode across codecs; **reasoning is fingerprinted on role alone** — the
+responses adapter projects the provider item id as the core text, so hashing
+it would break every pairing at the first reasoning message of a churn).
+Pass 0 then aligns the churn region head-first and tail-first, claiming an
+old covered id onto its new counterpart **only when the fingerprint matches
+at the aligned position**; the first mismatch stops the scan, so mid-history
+insertions and deletions honestly refuse to bridge. Sessions without a copy
+(the entire installed base at upgrade time) pay nothing: the first steady
+pass stores the copy, and the *next* drift is claimed positionally —
+migration is free because "cannot be recognized" is itself a fresh sequence.
+
+Why this does not contradict the position rejection below: raw position was
+rejected because with no memory of the old bytes, a positional claim is a
+**guess** and fails as misattribution. The copy converts the guess into a
+verified equality at an aligned offset — the same axiom, one layer up:
+fingerprint mismatch → honest non-recognition (unmatched, #1001/#1195
+lanes), never a wrong claim. The verification matrix lives in
+`tests/identity-proof.test.ts` (mechanism-level, judge-billed, after
+`tests/cache-proof.test.ts`): 4 wires × 3 phases (fold settles → id-scheme+
+serialization churn keeps coverage → mid-history edit honestly re-enters),
+a reconcile-off control proving the churn re-bills without the layer, and a
+cross-wire client swap (anthropic → chat) retaining coverage end to end.
+
 ## Known cost of the hash axiom — and how it was fixed
 
 Same bytes ⇒ same identity has a cost face: #1476 — a user re-sends a short
@@ -178,11 +229,11 @@ byte-identical. Identity bookkeeping is never involved.
 | Direction | Why rejected |
 |---|---|
 | Ingress-assigned ids carried by host storage | No carrier field on 3/4 lanes; provider namespace rejections on the 4th (#242, #1475); coverage measured at re-join, not ingress (per-host table above). |
-| Position/sequence as join key | Prefix instability is documented across six incident classes (#1148, #1102, #1307, #1247, host `/compact`, our own fold); failure mode is silent misattribution. |
+| Position/sequence as join key | Prefix instability is documented across six incident classes (#1148, #1102, #1307, #1247, host `/compact`, our own fold); failure mode is silent misattribution. Still true for the **ledger join**; #2480 later adopted position **with a self-stored canonical copy** for the fold-coverage layer only, where per-position verification removes the guessing — see above. |
 | Near-match tolerance on content | Byte-exactness is load-bearing (same argument as `SESSION-IDENTITY.md`); fuzzy joins misattribute silently on decompress. |
 | Promote `msg-proxy-*` to identity | Single lane, response-side coverage only, amplification-prone channel (tag-echo evidence), upstream namespace constraints. |
 | Marker-as-identity (tags persisted by hosts) | The tag-echo incidents show the channel corrupts what it carries; current design already strips it at both ends. |
-| Implicit aliasing of host-rewritten tool-call ids | Pairing a missing covered id with an inbound twin that has identical content under a different toolCallId requires host knowledge; without it the claim is a guess and misattributes on decompress (#2396: Prime rewrote composite ids across a provider switch). Detection-only shipped; the fix belongs at the host boundary (PLUGIN.md obligation 5). |
+| Implicit aliasing of host-rewritten tool-call ids | Pairing a missing covered id with an inbound twin that has identical content under a different toolCallId requires host knowledge; without it the claim is a guess and misattributes on decompress (#2396: Prime rewrote composite ids across a provider switch). Detection-only shipped; the fix belongs at the host boundary (PLUGIN.md obligation 5). #2480 update: Pass 0 now supplies that host knowledge (position + stored canonical fingerprint), so this class is claimed rather than only counted; PLUGIN.md obligation 5 stands for hosts that can canonicalize earlier. |
 
 ## Future direction
 
@@ -194,4 +245,5 @@ join, mNNNNN is the ledger, tags are the view.
 Related: #1496 (this document's prompt), `SESSION-IDENTITY.md` (session
 granularity), #1476 + kernel #459/#463 (echo discrimination), #242/#1475
 (Responses id constraints), #206/#673 (tag echo), #1479/#1482 (strict-echo
-repair), #1039 (tool-call byte-exactness invariant), #2396 (host-rewritten tool-call ids across a provider switch).
+repair), #1039 (tool-call byte-exactness invariant), #2396 (host-rewritten tool-call ids across a provider switch), #2480 (positional fold coverage;
+`tests/identity-proof.test.ts` is its proof matrix).
