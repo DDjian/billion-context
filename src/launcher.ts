@@ -379,13 +379,105 @@ export function extractDomains(upstreams: string[]): string[] {
     return out;
 }
 
+/** Shared accumulator for the per-client branches of {@link discoverRoutes}
+ *  (#1440 P3-A1): the six locals every family helper below reads and writes.
+ *  Field semantics identical to the pre-refactor locals of the same names. */
+interface DiscoverAcc {
+    httpsDomains: string[];
+    httpRewrites: HttpRewrite[];
+    httpsRewrites: HttpRewrite[];
+    httpEnvRoutes: string[];
+    httpsSeen: Set<string>;
+    rewriteKeys: Set<string>;
+}
+
+/** Family F1 — relay wrap for single-base-URL clients (claude, codebuddy's
+ *  base-URL leg, gemini, iflow, antigravity): unwrap the configured base URL
+ *  (the built-in `fallback` when unset/blank) and route it through the /bili/
+ *  URL form as a single httpRewrites entry under `key`, for any http(s)
+ *  upstream. Unparseable base URLs leave routes empty. Semantics extracted
+ *  byte-for-byte from those five branches. */
+function relayWrapRoute(acc: DiscoverAcc, cfgRaw: string | undefined, fallback: string, key: string): void {
+    const raw = nonEmpty(cfgRaw) ? cfgRaw : fallback;
+    const real = unwrapUpstream(raw);
+    try {
+        const url = new URL(real);
+        if ((url.protocol === "https:" || url.protocol === "http:") && !acc.rewriteKeys.has(key)) {
+            acc.rewriteKeys.add(key);
+            acc.httpRewrites.push({ key, realUpstream: real });
+        }
+    } catch {
+        // Unparseable base URL: leave routes empty (proxy still runs; the
+        // client falls back to its own default endpoint).
+    }
+}
+
+/** Family F2 — static cert-MITM host whitelist (qoder, trae, jcode, qwen,
+ *  copilot, amp, and the static legs of crush/zed): add each host to the
+ *  https inventory (deduped, lowercased; `stripPort` reduces `host:port` to
+ *  the port-less hostname so the entry matches the port-less SNI whitelist).
+ *  Semantics extracted byte-for-byte from those branches. */
+function addStaticHosts(acc: DiscoverAcc, hosts: readonly string[], stripPort: boolean): void {
+    for (const h of hosts) {
+        const host = (stripPort ? h.split(":", 2)[0]! : h).toLowerCase();
+        if (host && !acc.httpsSeen.has(host)) {
+            acc.httpsSeen.add(host);
+            acc.httpsDomains.push(host);
+        }
+    }
+}
+
+/** Family F3 — proxy-routable URL-set walk with the loopback carve-out (dsh,
+ *  kimi, mcode, aider): per raw URL — unwrap, parse, dedupe by the unwrapped
+ *  upstream, then split by destination: loopback → /bili/ rewrite inventory
+ *  under a numbered `<keyPrefix>-N` key; https remote → cert-MITM whitelist;
+ *  plain-http remote → HTTP_PROXY env routes. `skipWrappedLoopback` (kimi,
+ *  mcode) ignores loopbacks the user already wrapped at a previous proxy
+ *  origin; `anonCountsAll` (dsh) numbers keys across EVERY accepted unique
+ *  URL instead of only loopbacks (dsh counted uniques pre-refactor, the
+ *  others counted loopbacks). Semantics extracted byte-for-byte from those
+ *  branches. */
+function addProxyUrlSet(acc: DiscoverAcc, urls: readonly string[], keyPrefix: string, skipWrappedLoopback: boolean, anonCountsAll: boolean): void {
+    const seen = new Set<string>();
+    let anon = 0;
+    for (const raw of urls) {
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+            if (seen.has(real)) continue;
+            seen.add(real);
+            if (anonCountsAll) anon += 1;
+            if (isLoopbackHost(url.hostname)) {
+                if (skipWrappedLoopback && raw !== real) continue;
+                if (!anonCountsAll) anon += 1;
+                const key = `${keyPrefix}-${anon}`;
+                acc.rewriteKeys.add(key);
+                acc.httpRewrites.push({ key, realUpstream: real });
+            } else if (url.protocol === "https:") {
+                const host = url.hostname.toLowerCase();
+                if (host && !acc.httpsSeen.has(host)) {
+                    acc.httpsSeen.add(host);
+                    acc.httpsDomains.push(host);
+                }
+            } else if (!acc.httpEnvRoutes.includes(real)) {
+                acc.httpEnvRoutes.push(real);
+            }
+        } catch {
+            // Unparseable endpoint: skip.
+        }
+    }
+}
+
 export function discoverRoutes(client: ClientName, config: ClientConfig): DiscoveredRoutes {
-    const httpsDomains: string[] = [];
-    const httpRewrites: HttpRewrite[] = [];
-    const httpsRewrites: HttpRewrite[] = [];
-    const httpEnvRoutes: string[] = [];
-    const httpsSeen = new Set<string>();
-    const rewriteKeys = new Set<string>();
+    const acc: DiscoverAcc = {
+        httpsDomains: [],
+        httpRewrites: [],
+        httpsRewrites: [],
+        httpEnvRoutes: [],
+        httpsSeen: new Set<string>(),
+        rewriteKeys: new Set<string>(),
+    };
     const httpsRewriteKeys = new Set<string>();
     const classify = (raw: string | undefined, key: string): void => {
         if (!nonEmpty(raw)) return;
@@ -397,20 +489,20 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         }
         if (url.protocol === "https:") {
             const host = url.hostname;
-            if (host && !httpsSeen.has(host.toLowerCase())) {
-                httpsSeen.add(host.toLowerCase());
-                httpsDomains.push(host);
+            if (host && !acc.httpsSeen.has(host.toLowerCase())) {
+                acc.httpsSeen.add(host.toLowerCase());
+                acc.httpsDomains.push(host);
             }
             // Wrapped HTTPS (/bili/<https>): rewrite client base_url to the RAW
             // https upstream so HTTPS_PROXY routes it through the cert MITM.
             if (raw !== unwrapUpstream(raw) && !httpsRewriteKeys.has(key)) {
                 httpsRewriteKeys.add(key);
-                httpsRewrites.push({ key, realUpstream: unwrapUpstream(raw) });
+                acc.httpsRewrites.push({ key, realUpstream: unwrapUpstream(raw) });
             }
         } else if (url.protocol === "http:") {
-            if (!rewriteKeys.has(key)) {
-                rewriteKeys.add(key);
-                httpRewrites.push({ key, realUpstream: unwrapUpstream(raw) });
+            if (!acc.rewriteKeys.has(key)) {
+                acc.rewriteKeys.add(key);
+                acc.httpRewrites.push({ key, realUpstream: unwrapUpstream(raw) });
             }
         }
     };
@@ -420,18 +512,9 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // intercept it. Route every upstream — raw HTTP, raw HTTPS, or already
         // wrapped at a previous proxy origin — through the /bili/ URL form via
         // ANTHROPIC_BASE_URL instead (claude honors that env var natively).
-        const raw = nonEmpty(config.claude?.anthropicBaseUrl) ? config.claude!.anthropicBaseUrl! : "https://api.anthropic.com";
-        const real = unwrapUpstream(raw);
-        try {
-            const url = new URL(real);
-            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("ANTHROPIC_BASE_URL")) {
-                rewriteKeys.add("ANTHROPIC_BASE_URL");
-                httpRewrites.push({ key: "ANTHROPIC_BASE_URL", realUpstream: real });
-            }
-        } catch {
-            // Unparseable base URL: leave routes empty (proxy still runs; claude
-            // falls back to its own default endpoint).
-        }
+        // Unparseable base URL: leave routes empty (proxy still runs; claude
+        // falls back to its own default endpoint).
+        relayWrapRoute(acc, config.claude?.anthropicBaseUrl, "https://api.anthropic.com", "ANTHROPIC_BASE_URL");
     } else if (client === "codebuddy") {
         // codebuddy (Tencent CodeBuddy Code CLI) honors CODEBUDDY_BASE_URL
         // natively; its ModelProvider is the OpenAI SDK, so model traffic is
@@ -443,26 +526,17 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // must set CODEBUDDY_BASE_URL in settings.json or the shell.
         // models.json per-model urls BYPASS CODEBUDDY_BASE_URL, so they are
         // collected as MITM-whitelist inventory only, never rewritten (v1).
-        const raw = nonEmpty(config.codebuddy?.codebuddyBaseUrl) ? config.codebuddy!.codebuddyBaseUrl! : "https://tencent.sso.codebuddy.cn/v2";
-        const real = unwrapUpstream(raw);
-        try {
-            const url = new URL(real);
-            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("CODEBUDDY_BASE_URL")) {
-                rewriteKeys.add("CODEBUDDY_BASE_URL");
-                httpRewrites.push({ key: "CODEBUDDY_BASE_URL", realUpstream: real });
-            }
-        } catch {
-            // Unparseable base URL: leave routes empty (proxy still runs;
-            // codebuddy falls back to its own default endpoint).
-        }
+        // Unparseable base URL: leave routes empty (proxy still runs;
+        // codebuddy falls back to its own default endpoint).
+        relayWrapRoute(acc, config.codebuddy?.codebuddyBaseUrl, "https://tencent.sso.codebuddy.cn/v2", "CODEBUDDY_BASE_URL");
         for (const rawModelUrl of config.codebuddy?.modelUrls ?? []) {
             try {
                 const url = new URL(unwrapUpstream(rawModelUrl));
                 if (url.protocol !== "https:") continue;
                 const host = url.hostname;
-                if (host && !httpsSeen.has(host.toLowerCase())) {
-                    httpsSeen.add(host.toLowerCase());
-                    httpsDomains.push(host);
+                if (host && !acc.httpsSeen.has(host.toLowerCase())) {
+                    acc.httpsSeen.add(host.toLowerCase());
+                    acc.httpsDomains.push(host);
                 }
             } catch {
                 // Unparseable model url: skip.
@@ -498,13 +572,13 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 hermesSeen.add(name);
                 if (url.protocol === "https:") {
                     const host = url.hostname.toLowerCase();
-                    if (host && !httpsSeen.has(host)) {
-                        httpsSeen.add(host);
-                        httpsDomains.push(host);
+                    if (host && !acc.httpsSeen.has(host)) {
+                        acc.httpsSeen.add(host);
+                        acc.httpsDomains.push(host);
                     }
-                } else if (!rewriteKeys.has(name)) {
-                    rewriteKeys.add(name);
-                    httpRewrites.push({ key: name, realUpstream: real });
+                } else if (!acc.rewriteKeys.has(name)) {
+                    acc.rewriteKeys.add(name);
+                    acc.httpRewrites.push({ key: name, realUpstream: real });
                 }
             } catch {
                 // Unparseable endpoint: skip.
@@ -520,32 +594,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // rewrite in settings.yaml — the documented file exception. The
         // built-in deepseek-official route is captured via $DEEPSEEK_BASE_URL
         // in runLaunch.
-        const dshSeen = new Set<string>();
-        let anon = 0;
-        for (const raw of config.dsh?.baseUrls ?? []) {
-            const real = unwrapUpstream(raw);
-            try {
-                const url = new URL(real);
-                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-                if (dshSeen.has(real)) continue;
-                dshSeen.add(real);
-                anon += 1;
-                if (isLoopbackHost(url.hostname)) {
-                    rewriteKeys.add(`dsh-${anon}`);
-                    httpRewrites.push({ key: `dsh-${anon}`, realUpstream: real });
-                } else if (url.protocol === "https:") {
-                    const host = url.hostname.toLowerCase();
-                    if (host && !httpsSeen.has(host)) {
-                        httpsSeen.add(host);
-                        httpsDomains.push(host);
-                    }
-                } else if (!httpEnvRoutes.includes(real)) {
-                    httpEnvRoutes.push(real);
-                }
-            } catch {
-                // Unparseable endpoint: skip.
-            }
-        }
+        addProxyUrlSet(acc, config.dsh?.baseUrls ?? [], "dsh", false, true);
     } else if (client === "kimi") {
         // #757: Kimi Code honors standard proxy envs for all outbound traffic
         // EXCEPT an unconditional loopback NO_PROXY bypass (verified against
@@ -555,8 +604,6 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // destinations need a manual /bili/ prefix in config.toml — inventory
         // only here, feeding the banner. Endpoints the user already wrapped
         // (raw !== real) are skipped so they don't trigger the warning.
-        const kimiSeen = new Set<string>();
-        let anon = 0;
         const kimiUrls: string[] = [];
         for (const prov of Object.values(config.kimi?.providers ?? {})) {
             if (nonEmpty(prov.baseUrl)) kimiUrls.push(prov.baseUrl!);
@@ -564,36 +611,12 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         for (const raw of [...(config.kimi?.modelUrls ?? []), ...(config.kimi?.envUrls ?? [])]) {
             kimiUrls.push(raw);
         }
-        for (const raw of kimiUrls) {
-            const real = unwrapUpstream(raw);
-            try {
-                const url = new URL(real);
-                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-                if (kimiSeen.has(real)) continue;
-                kimiSeen.add(real);
-                if (isLoopbackHost(url.hostname)) {
-                    if (raw !== real) continue;
-                    anon += 1;
-                    rewriteKeys.add(`kimi-${anon}`);
-                    httpRewrites.push({ key: `kimi-${anon}`, realUpstream: real });
-                } else if (url.protocol === "https:") {
-                    const host = url.hostname.toLowerCase();
-                    if (host && !httpsSeen.has(host)) {
-                        httpsSeen.add(host);
-                        httpsDomains.push(host);
-                    }
-                } else if (!httpEnvRoutes.includes(real)) {
-                    httpEnvRoutes.push(real);
-                }
-            } catch {
-                // Unparseable endpoint: skip.
-            }
-        }
+        addProxyUrlSet(acc, kimiUrls, "kimi", true, false);
         if (kimiUrls.length === 0) {
             for (const h of KIMI_DEFAULT_MODEL_HOSTS) {
-                if (!httpsSeen.has(h)) {
-                    httpsSeen.add(h);
-                    httpsDomains.push(h);
+                if (!acc.httpsSeen.has(h)) {
+                    acc.httpsSeen.add(h);
+                    acc.httpsDomains.push(h);
                 }
             }
         }
@@ -603,42 +626,16 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // against @minimax-ai/code 0.4.12, packages/tui/src/cli/network-proxy.ts),
         // same shape as kimi above. Loopback upstreams need a manual /bili/
         // prefix in config.yaml — inventory only, feeding the banner.
-        const mcodeSeen = new Set<string>();
-        let anon = 0;
         const mcodeUrls: string[] = [];
         for (const prov of Object.values(config.mcode?.providers ?? {})) {
             if (nonEmpty(prov.baseUrl)) mcodeUrls.push(prov.baseUrl!);
         }
-        for (const raw of mcodeUrls) {
-            const real = unwrapUpstream(raw);
-            try {
-                const url = new URL(real);
-                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-                if (mcodeSeen.has(real)) continue;
-                mcodeSeen.add(real);
-                if (isLoopbackHost(url.hostname)) {
-                    if (raw !== real) continue;
-                    anon += 1;
-                    rewriteKeys.add(`mcode-${anon}`);
-                    httpRewrites.push({ key: `mcode-${anon}`, realUpstream: real });
-                } else if (url.protocol === "https:") {
-                    const host = url.hostname.toLowerCase();
-                    if (host && !httpsSeen.has(host)) {
-                        httpsSeen.add(host);
-                        httpsDomains.push(host);
-                    }
-                } else if (!httpEnvRoutes.includes(real)) {
-                    httpEnvRoutes.push(real);
-                }
-            } catch {
-                // Unparseable endpoint: skip.
-            }
-        }
+        addProxyUrlSet(acc, mcodeUrls, "mcode", true, false);
         if (mcodeUrls.length === 0) {
             for (const h of MCODE_DEFAULT_MODEL_HOSTS) {
-                if (!httpsSeen.has(h)) {
-                    httpsSeen.add(h);
-                    httpsDomains.push(h);
+                if (!acc.httpsSeen.has(h)) {
+                    acc.httpsSeen.add(h);
+                    acc.httpsDomains.push(h);
                 }
             }
         }
@@ -649,44 +646,22 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // NODE_EXTRA_CA_CERTS). Whitelist is the binary's static host map
         // (prod + regional + CN gateway); an explicit QODER_MODEL_SERVER_HOST
         // REPLACES it (qoder's own resolution order: env > static map).
-        const hosts = nonEmpty(config.qoder?.modelServerHost) ? [config.qoder!.modelServerHost!] : QODER_DEFAULT_MODEL_HOSTS;
-        for (const host of hosts) {
-            const h = host.toLowerCase();
-            if (h && !httpsSeen.has(h)) {
-                httpsSeen.add(h);
-                httpsDomains.push(h);
-            }
-        }
+        addStaticHosts(acc, nonEmpty(config.qoder?.modelServerHost) ? [config.qoder!.modelServerHost!] : QODER_DEFAULT_MODEL_HOSTS, false);
     } else if (client === "trae") {
         // #655: Trae CLI is a closed Go binary (no base-URL override) that
         // honors HTTPS_PROXY; the model API host is TRAE_CLI_API_HOST or the
         // default enterprise gateway. Whitelist the host(s) for cert-MITM so
         // the proxy can compress the model traffic. No /bili/ rewrite (the
         // scheme is hardcoded https).
-        const hosts = nonEmpty(config.trae?.modelApiHost)
-            ? [config.trae!.modelApiHost!]
-            : TRAE_DEFAULT_MODEL_HOSTS;
-        for (const h of hosts) {
-            // MITM whitelist matches the port-less SNI hostname (isMitmHost), so
-            // reduce host:port to its host or the entry never matches.
-            const host = h.split(":", 2)[0]!.toLowerCase();
-            if (host && !httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        // MITM whitelist matches the port-less SNI hostname (isMitmHost), so
+        // reduce host:port to its host or the entry never matches.
+        addStaticHosts(acc, nonEmpty(config.trae?.modelApiHost) ? [config.trae!.modelApiHost!] : TRAE_DEFAULT_MODEL_HOSTS, true);
     } else if (client === "jcode") {
         // jcode keeps provider base URLs in ~/.jcode/config.toml; there is no
         // TOML reader yet (add one for per-provider discovery). Whitelist the
         // default zai coding endpoint so the proxy compresses that leg;
         // loopback legs (local model servers, MCP) stay direct via NO_PROXY.
-        for (const h of JCODE_DEFAULT_MODEL_HOSTS) {
-            const host = h.split(":", 2)[0]!.toLowerCase();
-            if (host && !httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        addStaticHosts(acc, JCODE_DEFAULT_MODEL_HOSTS, true);
     } else if (client === "gemini") {
         // #1047: gemini-cli's @google/genai client switches to GATEWAY mode
         // whenever GOOGLE_GEMINI_BASE_URL is set and sends model traffic
@@ -695,34 +670,16 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // `<apiVersion>/models/…` itself (default v1beta), so wrap the bare
         // host origin — no /v1beta suffix. A user-exported base URL is a
         // relay: wrap IT instead of the stock endpoint (claude semantics).
-        const raw = nonEmpty(config.gemini?.baseUrl) ? config.gemini!.baseUrl! : "https://generativelanguage.googleapis.com";
-        const real = unwrapUpstream(raw);
-        try {
-            const url = new URL(real);
-            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("GOOGLE_GEMINI_BASE_URL")) {
-                rewriteKeys.add("GOOGLE_GEMINI_BASE_URL");
-                httpRewrites.push({ key: "GOOGLE_GEMINI_BASE_URL", realUpstream: real });
-            }
-        } catch {
-            // Unparseable base URL: leave routes empty (proxy still runs;
-            // gemini-cli falls back to its own default endpoint).
-        }
+        // Unparseable base URL: leave routes empty (proxy still runs;
+        // gemini-cli falls back to its own default endpoint).
+        relayWrapRoute(acc, config.gemini?.baseUrl, "https://generativelanguage.googleapis.com", "GOOGLE_GEMINI_BASE_URL");
     } else if (client === "iflow") {
         // #1047: iFlow CLI honors IFLOW_BASE_URL natively; its stock endpoint
         // is apis.iflow.cn/v1 (OpenAI wire — bili routes it by path). Same
         // relay-wrap semantics as gemini.
-        const raw = nonEmpty(config.iflow?.baseUrl) ? config.iflow!.baseUrl! : "https://apis.iflow.cn/v1";
-        const real = unwrapUpstream(raw);
-        try {
-            const url = new URL(real);
-            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("IFLOW_BASE_URL")) {
-                rewriteKeys.add("IFLOW_BASE_URL");
-                httpRewrites.push({ key: "IFLOW_BASE_URL", realUpstream: real });
-            }
-        } catch {
-            // Unparseable base URL: leave routes empty (proxy still runs;
-            // iFlow falls back to its own default endpoint).
-        }
+        // Unparseable base URL: leave routes empty (proxy still runs;
+        // iFlow falls back to its own default endpoint).
+        relayWrapRoute(acc, config.iflow?.baseUrl, "https://apis.iflow.cn/v1", "IFLOW_BASE_URL");
     } else if (client === "qwen") {
         // #1047: qwen-code is a heavily diverged multi-protocol fork of
         // gemini-cli with NO base-URL override env for routing; its undici
@@ -730,13 +687,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // so cert-MITM is the only route. Whitelist the stock DashScope/Qwen
         // gateways + common third-party provider hosts; custom relays go
         // through --mitm-domain.
-        for (const h of QWEN_DEFAULT_MODEL_HOSTS) {
-            const host = h.toLowerCase();
-            if (!httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        addStaticHosts(acc, QWEN_DEFAULT_MODEL_HOSTS, false);
     } else if (client === "antigravity") {
         // #2115: Antigravity's model channel runs inside the closed Go
         // language_server, which honors the undocumented CLOUD_CODE_URL env
@@ -748,18 +699,9 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // stock endpoint (claude semantics). Fallback if Google removes the
         // knob: cert-MITM (the server honors HTTPS_PROXY, no pinning) — see
         // CLIENTS.md (Gemini family section).
-        const raw = nonEmpty(config.antigravity?.baseUrl) ? config.antigravity!.baseUrl! : "https://cloudcode-pa.googleapis.com";
-        const real = unwrapUpstream(raw);
-        try {
-            const url = new URL(real);
-            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("CLOUD_CODE_URL")) {
-                rewriteKeys.add("CLOUD_CODE_URL");
-                httpRewrites.push({ key: "CLOUD_CODE_URL", realUpstream: real });
-            }
-        } catch {
-            // Unparseable base URL: leave routes empty (proxy still runs;
-            // Antigravity falls back to its own default endpoint).
-        }
+        // Unparseable base URL: leave routes empty (proxy still runs;
+        // Antigravity falls back to its own default endpoint).
+        relayWrapRoute(acc, config.antigravity?.baseUrl, "https://cloudcode-pa.googleapis.com", "CLOUD_CODE_URL");
     } else if (client === "aider") {
         // #1048: aider's Python stack (litellm → httpx, plus requests) honors
         // standard proxy envs for all outbound traffic, so no URL rewriting
@@ -771,37 +713,12 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // zero-config-change contract forbids). Endpoints come from runtime
         // env + .aider.conf.yml + CLI args (merged by runLaunch); nothing
         // declared → the common defaults.
-        const aiderSeen = new Set<string>();
-        let anon = 0;
-        for (const raw of config.aider?.baseUrls ?? []) {
-            const real = unwrapUpstream(raw);
-            try {
-                const url = new URL(real);
-                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-                if (aiderSeen.has(real)) continue;
-                aiderSeen.add(real);
-                if (isLoopbackHost(url.hostname)) {
-                    anon += 1;
-                    rewriteKeys.add(`aider-${anon}`);
-                    httpRewrites.push({ key: `aider-${anon}`, realUpstream: real });
-                } else if (url.protocol === "https:") {
-                    const host = url.hostname.toLowerCase();
-                    if (host && !httpsSeen.has(host)) {
-                        httpsSeen.add(host);
-                        httpsDomains.push(host);
-                    }
-                } else if (!httpEnvRoutes.includes(real)) {
-                    httpEnvRoutes.push(real);
-                }
-            } catch {
-                // Unparseable endpoint: skip.
-            }
-        }
+        addProxyUrlSet(acc, config.aider?.baseUrls ?? [], "aider", false, false);
         if ((config.aider?.baseUrls ?? []).length === 0) {
             for (const h of AIDER_DEFAULT_MODEL_HOSTS) {
-                if (!httpsSeen.has(h)) {
-                    httpsSeen.add(h);
-                    httpsDomains.push(h);
+                if (!acc.httpsSeen.has(h)) {
+                    acc.httpsSeen.add(h);
+                    acc.httpsDomains.push(h);
                 }
             }
         }
@@ -810,43 +727,25 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // route (Go net/http honors HTTPS_PROXY + SSL_CERT_FILE). Whitelist is
         // GitHub's own CI firewall allowlist for the CLI: api.githubcopilot.com
         // plus the per-plan subdomains.
-        for (const h of COPILOT_DEFAULT_MODEL_HOSTS) {
-            const host = h.split(":", 2)[0]!.toLowerCase();
-            if (host && !httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        addStaticHosts(acc, COPILOT_DEFAULT_MODEL_HOSTS, true);
     } else if (client === "amp") {
         // #1049: closed Go binary like copilot; ampcode.com carries both the
         // model leg and the control plane, so one entry covers both.
-        for (const h of AMP_DEFAULT_MODEL_HOSTS) {
-            const host = h.split(":", 2)[0]!.toLowerCase();
-            if (host && !httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        addStaticHosts(acc, AMP_DEFAULT_MODEL_HOSTS, true);
     } else if (client === "crush") {
         // #2340: open-source Go binary — cert-MITM like amp/copilot (net/http
         // honors HTTPS_PROXY; CA rides SSL_CERT_FILE). Whitelist the built-in
         // provider hosts plus custom provider base_urls discovered from
         // crush.json (readCrushConfig, https only); exotic relays ride
         // --mitm-domain.
-        for (const h of CRUSH_DEFAULT_MODEL_HOSTS) {
-            const host = h.split(":", 2)[0]!.toLowerCase();
-            if (host && !httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        addStaticHosts(acc, CRUSH_DEFAULT_MODEL_HOSTS, true);
         for (const raw of config.crush?.baseUrls ?? []) {
             try {
                 if (new URL(raw).protocol !== "https:") continue;
                 const host = new URL(raw).hostname.toLowerCase();
-                if (host && !httpsSeen.has(host)) {
-                    httpsSeen.add(host);
-                    httpsDomains.push(host);
+                if (host && !acc.httpsSeen.has(host)) {
+                    acc.httpsSeen.add(host);
+                    acc.httpsDomains.push(host);
                 }
             } catch {}
         }
@@ -856,20 +755,14 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // probing on Linux). Whitelist the built-in provider hosts plus
         // custom provider api_urls discovered from settings.json
         // (readZedConfig, https only); exotic relays ride --mitm-domain.
-        for (const h of ZED_DEFAULT_MODEL_HOSTS) {
-            const host = h.split(":", 2)[0]!.toLowerCase();
-            if (host && !httpsSeen.has(host)) {
-                httpsSeen.add(host);
-                httpsDomains.push(host);
-            }
-        }
+        addStaticHosts(acc, ZED_DEFAULT_MODEL_HOSTS, true);
         for (const raw of config.zed?.baseUrls ?? []) {
             try {
                 if (new URL(raw).protocol !== "https:") continue;
                 const host = new URL(raw).hostname.toLowerCase();
-                if (host && !httpsSeen.has(host)) {
-                    httpsSeen.add(host);
-                    httpsDomains.push(host);
+                if (host && !acc.httpsSeen.has(host)) {
+                    acc.httpsSeen.add(host);
+                    acc.httpsDomains.push(host);
                 }
             } catch {
                 continue;
@@ -892,8 +785,8 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 if (url.protocol !== "http:" && url.protocol !== "https:") continue;
                 if (seen.has(real)) continue;
                 seen.add(real);
-                rewriteKeys.add(name);
-                httpRewrites.push({ key: name, realUpstream: real });
+                acc.rewriteKeys.add(name);
+                acc.httpRewrites.push({ key: name, realUpstream: real });
             } catch {}
         }
     } else {
@@ -903,6 +796,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         classify(config.codex?.openaiBaseUrl, "openai_base_url");
     }
 
+    const { httpsDomains, httpRewrites, httpsRewrites, httpEnvRoutes } = acc;
     return { httpsDomains, httpRewrites, httpsRewrites, httpEnvRoutes };
 }
 
