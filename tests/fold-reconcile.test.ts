@@ -208,7 +208,11 @@ describe("reconcileFoldCoverage (#1921)", () => {
         const churned = originals.map((m, i) => (i === 4 ? msg("a4-new", "user", "stable context  words 4\r\n") : m));
         const result = reconcileFoldCoverage(session, churned, opts("repair"));
         assert.equal(result.kind, "reanchored");
-        assert.equal(result.byNorm, 1);
+        // whitespace-only churn now claims POSITIONALLY (#2487 prose
+        // normalization: canon equal after NFC/CR→LF/space-collapse, so Pass 0
+        // pairs it; the norm pass no longer needs to)
+        assert.equal(result.byPos, 1);
+        assert.equal(result.byNorm, 0);
         const rewritten = allIds.map((id, i) => (i === 4 ? "a4-new" : id));
         assert.deepEqual(session.state.blocks[0].effectiveMessageIds, rewritten);
         assert.deepEqual(session.state.blocks[0].directMessageIds, rewritten);
@@ -683,6 +687,11 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         churned.push(msg("b9", "assistant", "bookend nine"));
         const session = capSession(originals.map((m) => m.id!));
         reconcileFoldCoverage(session, originals, opts);
+        // #2487 prose normalization makes whitespace churn positionally
+        // claimable, which would route ALL 8 middles through Pass 0; drop the
+        // stored copy so this test keeps exercising the tool/norm passes and
+        // their #2334 lazy-norm accounting (the no-copy fallback path).
+        delete (session.metadata as Record<string, unknown>).foldPositions;
 
         resetNormalizedIdentityWork();
         const result = reconcileFoldCoverage(session, churned, opts);
