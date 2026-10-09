@@ -225,13 +225,13 @@ test("fetchWithRetry: external abort is never replayed", async () => {
     }
 });
 
-test("fetchWithRetry: connect-phase timeout and DNS failures are replayed within the budget (#1453)", async () => {
+test("fetchWithRetry: connect-phase timeout, ICMP-unreachable and DNS failures are replayed within the budget (#1453, #2465)", async () => {
     _resetFetchUtilForTest();
     const prevBase = process.env.BILI_REPLAY_RETRY_BASE_MS;
     process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
     const origFetch = globalThis.fetch;
     try {
-        for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"], ["ENOTFOUND", "dns"]] as const) {
+        for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"], ["EHOSTUNREACH", "upstream-unreachable"], ["ENOTFOUND", "dns"]] as const) {
             let attempts = 0;
             const retries: Array<{ status: number; detail: string }> = [];
             globalThis.fetch = (async () => {
