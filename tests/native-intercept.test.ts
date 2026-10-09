@@ -13,6 +13,14 @@ test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://localhost:9123/v1/messages/"), true);
 });
 
+test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
+    assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
 test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/models"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:36485/__bili/plugin/manifest"), false);
@@ -22,6 +30,12 @@ test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("file:///tmp/v1/messages"), false);
     assert.equal(isModelApiUrl("not a url"), false);
     assert.equal(isModelApiUrl("https://api.anthropic.com/v1/messages/count_tokens"), false);
+    // Google wire: only the three methods the proxy core prepares count.
+    // Model listing, unprepared methods (:predict) and case drift stay direct.
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:predict"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:generatecontent"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:18787/bili/http://127.0.0.1:8317/v1beta/models/m:generateContent"), false);
 });
 
 function fakeFetch(sink: string[]) {
@@ -88,6 +102,31 @@ test("install: rewrites model URLs once ready", async () => {
         assert.equal(res.status, 200);
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("install: rewrites Google-wire model URLs through the proxy (#2493)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40006", ready: Promise.resolve("http://127.0.0.1:40006") };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40006/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"]);
+});
+
+test("install: already-routed Google-wire /bili/ request gets plugin headers re-stamped (#2493)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40007",
+        ready: Promise.resolve("http://127.0.0.1:40007"),
+        headersFor: () => ({ "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "session-g" }),
+    };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:40007/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:40007/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse");
+    assert.equal(sink[0].headers["x-bili-plugin"], "dsh");
+    assert.equal(sink[0].headers["x-bili-plugin-conversation"], "session-g");
 });
 
 test("install: waits for a not-yet-ready proxy before rewriting", async () => {
@@ -475,6 +514,11 @@ test("routedBiliModelUrl: extracts the embedded model URL from /bili/ form", asy
     const { routedBiliModelUrl } = await import("../src/agent/native-intercept.ts");
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"), "http://127.0.0.1:8199/v1/messages");
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages?beta=1"), "https://api.anthropic.com/v1/messages?beta=1");
+    // Google-wire embedded target (#2493): header re-stamping applies too.
+    assert.equal(
+        routedBiliModelUrl("http://127.0.0.1:40001/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"),
+        "http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse",
+    );
     // non-model embedded targets and plugin endpoints do not count
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/https://registry.npmjs.org/pkg"), undefined);
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/__bili/plugin/manifest"), undefined);
