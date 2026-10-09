@@ -274,15 +274,17 @@ export function canonicalJson(value: unknown): string {
 
 /** #2480: canonical text for the positional fingerprint. JSON-shaped payloads
  *  (tool-call arguments) project through canonicalJson; everything else
- *  (prose, XML-ish tool results) uses the RAW bytes — no whitespace folding,
- *  so a real edit is still a real mismatch. */
+ *  (prose, XML-ish tool results) projects through normalizeMessageText (NFC +
+ *  CR→LF + whitespace collapse) — formatting churn must not break the pairing,
+ *  while any real content edit survives normalization and still mismatches
+ *  (#2487's prose discipline, adopted). */
 export function canonicalTextOf(text: string): string {
     const t = text.trimStart();
-    if (!t.startsWith("{") && !t.startsWith("[")) return text;
+    if (!t.startsWith("{") && !t.startsWith("[")) return normalizeMessageText(text);
     try {
         return canonicalJson(JSON.parse(t));
     } catch {
-        return text;
+        return normalizeMessageText(text);
     }
 }
 
@@ -357,23 +359,35 @@ function coveredIdsOf(blocks: BlockLike[]): Set<string> {
 
 /** Pure core: plan the reconciliation between the previous pass order and the
  *  incoming messages. Exposed for unit tests. `positions` (#2480) is the
- *  stored positional fingerprint copy aligned 1:1 with `oldOrder`; when its
- *  length matches, Pass 0 claims by position+canonical-fingerprint before the
- *  anchor passes run. */
+ *  stored positional fingerprint copy {ids, canon} (#2487's self-contained
+ *  storage shape, adopted); Pass 0 claims by position + canonical fingerprint
+ *  before the anchor passes run. */
 export function planReconciliation(
     oldOrder: string[],
     anchors: Record<string, FoldAnchor>,
     msgs: CoreMessage[],
     covered: Set<string>,
-    positions?: string[],
+    positions?: { ids: string[]; canon: string[] },
 ): ReconciliationPlan {
     const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byNorm: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined };
-    // #2480: the positional copy is built on EVERY pass (fresh where the id at
-    // that index changed, reused verbatim where it did not — same id = same
-    // bytes), so the first pass after an upgrade establishes it and every
-    // later drift is position-claimable. Pass 0 itself only runs when the
-    // STORED copy aligns 1:1 with oldOrder.
-    const stored = positions !== undefined && positions.length === oldOrder.length ? positions : undefined;
+    // #2480: the positional copy is built on EVERY pass, so the first pass
+    // after an upgrade establishes it and every later drift is
+    // position-claimable. The fast path is reuse-by-ID (#2487): same id =
+    // same bytes = same fingerprint, wherever the message now sits — steady
+    // state pays zero projections even when positions shift (head deletion,
+    // truncation), not just when the array is byte-identical.
+    const canonById = new Map<string, string>();
+    if (positions !== undefined) {
+        const pids = positions.ids;
+        const pcanon = positions.canon;
+        for (let i = 0; i < pids.length && i < pcanon.length; i++) canonById.set(pids[i], pcanon[i]);
+    }
+    // Pass 0's old-side coordinate system is only valid when the stored copy's
+    // ids align 1:1 with the order backbone. Self-contained storage makes the
+    // check exact: a desync (backbone semantics drift, partial write) disables
+    // Pass 0 instead of silently misaligning fingerprints.
+    const stored = positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length
+        && positions.ids.every((id, i) => id === oldOrder[i]) ? positions.canon : undefined;
     const canon: string[] = [];
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
@@ -382,7 +396,8 @@ export function planReconciliation(
         const i = newOrder.length;
         newOrder.push(m.id);
         byId.set(m.id, m);
-        canon.push(stored !== undefined && i < stored.length && oldOrder[i] === m.id ? stored[i] : positionalFingerprint(m));
+        const priorCanon = canonById.get(m.id);
+        canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m));
     }
     plan.newOrder = newOrder;
     plan.nextCanon = canon;
@@ -618,17 +633,24 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
     const oldOrder: string[] = (session.metadata[METADATA_ORDER] as string[] | undefined) ?? [];
-    // #2480: the positional copy is only usable when it aligns 1:1 with the
-    // stored order backbone (older sessions / partial writes simply lack it —
-    // pass 1/2 behavior, and this pass rebuilds the copy: migration is free).
-    const storedPositions = session.metadata[METADATA_POSITIONS] as string[] | undefined;
-    const positions = storedPositions !== undefined && storedPositions.length === oldOrder.length ? storedPositions : undefined;
+    // #2480: self-contained positional copy {ids, canon} (#2487's storage
+    // shape, adopted) — the pair is internally consistent even if the order
+    // backbone's semantics change later. The brief plain-canon[] form from
+    // the #2488 merge window is still accepted (aligned against oldOrder):
+    // unreleased, but sessions written by local builds keep reconciling.
+    const storedRaw = session.metadata[METADATA_POSITIONS] as { ids?: unknown; canon?: unknown } | string[] | undefined;
+    let positions: { ids: string[]; canon: string[] } | undefined;
+    if (Array.isArray(storedRaw)) {
+        positions = storedRaw.length === oldOrder.length ? { ids: oldOrder, canon: storedRaw } : undefined;
+    } else if (storedRaw !== undefined && Array.isArray(storedRaw.ids) && Array.isArray(storedRaw.canon)) {
+        positions = { ids: storedRaw.ids as string[], canon: storedRaw.canon as string[] };
+    }
 
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
-        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} byTool=${plan.byTool} byNorm=${plan.byNorm} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} byTool=${plan.byTool} byNorm=${plan.byNorm} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
     }
 
     // Seed/refresh anchors for covered ids present in this pass (including
@@ -686,10 +708,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
     const nextOrder = plan.newOrder.slice(-MAX_ORDER);
     // #2480: roll the positional copy forward in the same window as the order
-    // backbone (same slice, same pass) so foldPositions[i] always fingerprints
-    // the message whose id is foldAnchorOrder[i].
+    // backbone (same slice, same pass), stored self-contained as {ids, canon}
+    // so the pair can never desync from itself (#2487's shape).
     if (plan.nextCanon !== undefined) {
-        session.metadata[METADATA_POSITIONS] = plan.nextCanon.slice(-MAX_ORDER);
+        session.metadata[METADATA_POSITIONS] = { ids: nextOrder, canon: plan.nextCanon.slice(-MAX_ORDER) };
     }
 
     // #2202: per-block coverage evidence for the ledger's conditional accrual

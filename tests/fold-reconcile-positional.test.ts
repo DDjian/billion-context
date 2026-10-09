@@ -118,7 +118,7 @@ function codecSwitch(old: CoreMessage[], editIndex?: number, idPrefix = "new"): 
     });
 }
 
-function planFor(old: CoreMessage[], next: CoreMessage[], positions?: string[]) {
+function planFor(old: CoreMessage[], next: CoreMessage[], positions?: { ids: string[]; canon: string[] }) {
     const order = old.map((m) => m.id as string);
     const anchors: Record<string, FoldAnchor> = {};
     for (const m of old) anchors[m.id as string] = anchorOf(m);
@@ -126,10 +126,16 @@ function planFor(old: CoreMessage[], next: CoreMessage[], positions?: string[]) 
     return { plan: planReconciliation(order, anchors, next, covered, positions), order, covered, anchors };
 }
 
+/** The stored-copy form reconcileFoldCoverage persists after a pass over
+ *  `msgs` (ids + fingerprints of THAT pass, pre-churn). */
+function storedOf(msgs: CoreMessage[]): { ids: string[]; canon: string[] } {
+    return { ids: msgs.map((m) => m.id as string), canon: msgs.map((m) => positionalFingerprint(m)) };
+}
+
 describe("planReconciliation Pass 0 (#2480)", () => {
     test("codec switch: full re-serialization is claimed positionally, zero anchor-pass work", () => {
         const old = oldHistory();
-        const pos = old.map((m) => positionalFingerprint(m));
+        const pos = storedOf(old);
         const { plan } = planFor(old, codecSwitch(old), pos);
         assert.equal(plan.byPos, 10, "every covered id claimed at its position");
         assert.equal(plan.byTool, 0, "rewritten toolCallId scheme defeats the tool pass — positional did the work");
@@ -149,7 +155,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
 
     test("append-only resend with stored copy claims nothing and hashes only the appended tail", () => {
         const old = oldHistory();
-        const pos = old.map((m) => positionalFingerprint(m));
+        const pos = storedOf(old);
         resetPositionalFingerprintWork();
         const { plan } = planFor(old, old, pos);
         assert.equal(plan.claims.size, 0);
@@ -161,7 +167,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
 
     test("mid-history edit: scans stop at the break, no misattribution", () => {
         const old = oldHistory();
-        const pos = old.map((m) => positionalFingerprint(m));
+        const pos = storedOf(old);
         const { plan } = planFor(old, codecSwitch(old, 5), pos);
         // head claims 0-4, tail claims 6-9, edited 5 is honestly unmatched
         assert.equal(plan.byPos, 9);
@@ -174,7 +180,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
 
     test("insertion inside the churn region: dual scans still realign both flanks", () => {
         const old = oldHistory();
-        const pos = old.map((m) => positionalFingerprint(m));
+        const pos = storedOf(old);
         const switched = codecSwitch(old);
         const next = [...switched.slice(0, 5), msg("ins_0", "user", "brand new inserted turn"), ...switched.slice(5)];
         const { plan } = planFor(old, next, pos);
@@ -191,7 +197,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
             msg("dup_b", "user", "ok"),
             ...oldHistory().slice(6),
         ];
-        const pos = old.map((m) => positionalFingerprint(m));
+        const pos = storedOf(old);
         const switched = codecSwitch(old);
         const next = [...switched.slice(0, 4), switched[4], ...switched.slice(6)]; // drop one twin
         const { plan } = planFor(old, next, pos);
@@ -207,7 +213,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
             msg("old_10", "user", "tail turn one"),
             msg("old_11", "assistant", "tail turn two"),
         ];
-        const pos = old.map((m) => positionalFingerprint(m));
+        const pos = storedOf(old);
         const compacted = [
             msg("summary_0", "assistant", "[compacted summary of the first half]"),
             ...codecSwitch(old.slice(6)),
@@ -220,6 +226,59 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const headUnmatched = plan.unmatched.filter((id) => Number(id.slice(4)) < 6);
         assert.equal(headUnmatched.length, 6);
     });
+
+    test("prose whitespace churn keeps the pairing (#2487 discipline)", () => {
+        const old = [
+            msg("p_0", "user", "hello   world\r\nsecond   line"),
+            msg("p_1", "assistant", "answer"),
+            msg("p_2", "user", "done"),
+        ];
+        const churned = [
+            msg("q_0", "user", "hello world\nsecond line"), // whitespace collapsed, CR→LF
+            msg("q_1", "assistant", "answer"),
+            msg("q_2", "user", "done"),
+        ];
+        const { plan } = planFor(old, churned, storedOf(old));
+        assert.equal(plan.byPos, 3, "formatting churn must not break the positional pairing");
+        // …but a REAL edit still mismatches
+        const edited = [msg("q_0", "user", "hello world\nsecond line EDITED"), churned[1]!, churned[2]!];
+        const { plan: plan2 } = planFor(old, edited, storedOf(old));
+        assert.equal(plan2.byPos, 2);
+        assert.deepEqual(plan2.unmatched, ["p_0"]);
+    });
+
+    test("reuse-by-id fast path: surviving ids pay zero hashes even when positions shift", () => {
+        const old = oldHistory();
+        // head deletion: every surviving id SHIFTS left — same-index reuse would
+        // recompute all of them, reuse-by-id reuses all of them.
+        const shifted = old.slice(1);
+        const pos = storedOf(old); // counted BEFORE the seam reset
+        resetPositionalFingerprintWork();
+        const { plan } = planFor(old, shifted, pos);
+        assert.equal(positionalFingerprintWorkCount(), 0, "surviving ids reuse their stored canon wherever they sit");
+        assert.ok(plan.nextCanon !== undefined && plan.nextCanon.every((c) => typeof c === "string"));
+    });
+
+    test("desync guard: a stored copy whose ids no longer match the backbone disables Pass 0 (self-containment)", () => {
+        const old = oldHistory();
+        const drifted = codecSwitch(old);
+        const wrong = { ids: [...old.map((m) => m.id as string)].reverse(), canon: old.map((m) => positionalFingerprint(m)) };
+        const { plan } = planFor(old, drifted, wrong);
+        assert.equal(plan.byPos, 0, "misaligned copy must not claim");
+        assert.ok(plan.unmatched.length > 0, "honest fallback to the legacy passes");
+    });
+
+    test("legacy plain-canon[] storage from the #2488 merge window still reconciles", () => {
+        const old = oldHistory();
+        const drifted = codecSwitch(old);
+        const order = old.map((m) => m.id as string);
+        const anchors: Record<string, FoldAnchor> = {};
+        for (const m of old) anchors[m.id as string] = anchorOf(m);
+        const covered = new Set(order);
+        // pre-#2487 shape: bare canon array, aligned with the backbone
+        const plan = planReconciliation(order, anchors, drifted, covered, { ids: order, canon: old.map((m) => positionalFingerprint(m)) });
+        assert.equal(plan.byPos, 10);
+    });
 });
 
 describe("reconcileFoldCoverage positional wiring (#2480)", () => {
@@ -230,9 +289,11 @@ describe("reconcileFoldCoverage positional wiring (#2480)", () => {
         resetPositionalFingerprintWork();
         const r1 = reconcileFoldCoverage(session, old, opts("repair"));
         assert.equal(r1.kind, "resend");
-        assert.ok(Array.isArray(session.metadata.foldPositions));
-        assert.equal((session.metadata.foldPositions as string[]).length, 10);
-        assert.equal((session.metadata.foldAnchorOrder as string[]).length, 10);
+        const stored1 = session.metadata.foldPositions as { ids: string[]; canon: string[] };
+        assert.ok(Array.isArray(stored1.ids) && Array.isArray(stored1.canon), "self-contained {ids, canon} shape (#2487)");
+        assert.equal(stored1.ids.length, 10);
+        assert.deepEqual(stored1.ids, session.metadata.foldAnchorOrder as string[]);
+        assert.equal(stored1.canon.length, 10);
 
         // Pass 2 — codec switch: positional claims repair the blocks.
         const next = codecSwitch(old);
@@ -243,8 +304,9 @@ describe("reconcileFoldCoverage positional wiring (#2480)", () => {
         const coveredNow = (session.state.blocks as { effectiveMessageIds: string[] }[])[0].effectiveMessageIds;
         assert.deepEqual(coveredNow.sort(), next.map((m) => m.id as string).sort());
         // the copy rolled forward to the new ids (aligned with the new order)
-        assert.deepEqual(session.metadata.foldPositions, next.map((m) => positionalFingerprint(m)));
-        assert.deepEqual(session.metadata.foldAnchorOrder, next.map((m) => m.id as string));
+        const stored2 = session.metadata.foldPositions as { ids: string[]; canon: string[] };
+        assert.deepEqual(stored2.canon, next.map((m) => positionalFingerprint(m)));
+        assert.deepEqual(stored2.ids, next.map((m) => m.id as string));
 
         // Pass 3 — append on the new ids: steady again; only the appended
         // message hashes (resent prefix rides the fast path).
@@ -259,10 +321,10 @@ describe("reconcileFoldCoverage positional wiring (#2480)", () => {
         const session = fakeSession([{ effectiveMessageIds: old.map((m) => m.id as string) }]);
         // Seed only anchors/order the legacy way (no positions key).
         reconcileFoldCoverage(session, old, opts("repair"));
-        assert.ok(Array.isArray(session.metadata.foldPositions), "copy established on the very first steady pass");
+        assert.ok(Array.isArray((session.metadata.foldPositions as { ids: string[] }).ids), "copy established on the very first steady pass");
         delete session.metadata.foldPositions; // simulate the pre-upgrade state
         reconcileFoldCoverage(session, old, opts("repair")); // steady pass rebuilds it
-        assert.ok(Array.isArray(session.metadata.foldPositions));
+        assert.ok(Array.isArray((session.metadata.foldPositions as { canon: string[] }).canon));
         const drift = codecSwitch(old);
         const r = reconcileFoldCoverage(session, drift, opts("repair"));
         assert.equal(r.byPos, 10);
@@ -283,7 +345,7 @@ describe("reconcileFoldCoverage positional wiring (#2480)", () => {
         assert.equal(rA.byPos, 0);
         assert.equal(rA.byNorm, 7);
         assert.equal(rA.unmatched, 3);
-        assert.ok(Array.isArray(session.metadata.foldPositions), "copy built from driftA bytes");
+        assert.ok(Array.isArray((session.metadata.foldPositions as { canon: string[] }).canon), "copy built from driftA bytes");
         // Drift B — another codec hop: the 7 reanchored ids are now positional;
         // the 3 legacy remnants (still keyed by their pre-upgrade ids) honestly
         // stay unmatched — blocks keep them, the #2193 machinery reports.
