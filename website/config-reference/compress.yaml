@@ -88,10 +88,10 @@ entries:
     group: compress
     id: cw.ssm
     render: compress-row
-    desc_en: "Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 \"stream required\" rejections and never arms on gateway timeouts."
-    desc_zh: "强制 preflight 摘要从首次尝试起就走流式（SSE）请求。适用于上游位于会掐断长非流式补全的网关之后（如 Cloudflare HTTP 524）：错误驱动的自学习只认 400 \"stream required\"，网关超时永远无法触发。"
-    site_en: "Force streaming (SSE) summarization from the first attempt — an escape hatch for upstreams behind gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the error-driven self-learn cannot detect."
-    site_zh: "强制摘要从首次起走流式（SSE）——用于上游在会掐断长非流式调用的网关之后（如 Cloudflare 524），错误自学习无法感知该场景。"
+    desc_en: "Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip."
+    desc_zh: "强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。"
+    site_en: "Force streaming (SSE) summarization from the first attempt — stream-mandating upstreams now self-heal via a one-shot SSE probe on any non-streaming 400 (#2494); kept as the escape hatch for gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the self-learn cannot detect, or to skip the one probe round-trip."
+    site_zh: "强制摘要从首次起走流式（SSE）——要求流式的上游现在通过任何非流式 400 上的一次性 SSE 探测自愈（#2494）；保留作为会掐断长非流式调用的网关（如 Cloudflare 524）的逃生通道（自学习无法感知该场景），也可用于省去一次探测往返。"
   - key: compress.preserveRecentMessages
     type: number
     default: "kernel ≈5"

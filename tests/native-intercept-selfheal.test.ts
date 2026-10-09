@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import test from "node:test";
 import { installNativeFetchIntercept, type NativeInterceptState } from "../src/agent/native-intercept.js";
 
@@ -344,4 +345,115 @@ test("#1662: a steady-state foreign wrapper wrapping bili's chain stays in the c
     // top link), and the request reached the native fetch exactly once.
     assert.deepEqual(seenByWrapper, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
     assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
+
+// Mirrors pi-web-access's marker, install guard, scoped proxy and loopback bypass.
+function webAccessProxy() {
+    const proxy = new AsyncLocalStorage<boolean>();
+    let installs = 0;
+    let calls = 0;
+    return {
+        get installs() { return installs; },
+        get calls() { return calls; },
+        install() {
+            const base = globalThis.fetch;
+            if (Reflect.get(base, "__piWebAccessProxyFetch") === true) return;
+            const wrapper = (async (input: string | URL | Request, init?: RequestInit) => {
+                calls++;
+                const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+                if (proxy.getStore() && url.hostname !== "127.0.0.1") return new Response("via-web-proxy");
+                return base(input, init);
+            }) as typeof fetch;
+            Object.defineProperty(wrapper, "__piWebAccessProxyFetch", { value: true });
+            installs++;
+            globalThis.fetch = wrapper;
+        },
+        run<T>(fn: () => T): T {
+            this.install();
+            return proxy.run(true, fn);
+        },
+    };
+}
+
+for (const first of ["bili", "web-access"]) {
+    test(`pi-web-access: ${first} installs first, 1000 proxy scopes keep one wrapper and routing`, async () => {
+        const nativeSink: string[] = [];
+        await withScope(fakeFetch(nativeSink), async () => {
+            const web = webAccessProxy();
+            if (first === "web-access") web.install();
+            const decisions: string[] = [];
+            installNativeFetchIntercept({
+                origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+                onDispatch: (_url, action) => { decisions.push(action); },
+            });
+            web.install();
+            const top = globalThis.fetch;
+            assert.equal(Reflect.get(top, "__piWebAccessProxyFetch"), true);
+            for (let i = 0; i < 1000; i++) {
+                assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+                assert.equal(globalThis.fetch, top);
+            }
+            await web.run(() => globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" }));
+            await globalThis.fetch("https://example.invalid/direct");
+            assert.equal(web.installs, 1);
+            assert.equal(web.calls, 1002);
+            assert.deepEqual(decisions.filter(action => action === "rewrite"), ["rewrite"]);
+        });
+        assert.deepEqual(nativeSink, [
+            "http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages",
+            "https://example.invalid/direct",
+        ]);
+    });
+}
+
+test("pi-web-access: preserve an older proxy wrapper and still truncate unknown history beneath it", async () => {
+    const nativeSink: string[] = [];
+    await withScope(fakeFetch(nativeSink), async () => {
+        installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+        let unknownCalls = 0;
+        for (let i = 0; i < 16000; i++) {
+            const base = globalThis.fetch;
+            globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+                unknownCalls++;
+                return base(input, init);
+            }) as typeof fetch;
+        }
+        const web = webAccessProxy();
+        web.install();
+        await web.run(async () => {
+            const base = globalThis.fetch;
+            globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => base(input, init)) as typeof fetch;
+            const response = await globalThis.fetch("https://example.invalid/article");
+            assert.equal(await response.text(), "via-web-proxy");
+            assert.equal(web.installs, 1);
+            await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+        });
+        assert.equal(web.calls, 2);
+        assert.equal(unknownCalls, 0);
+    });
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+test("pi-web-access: the marker follows the live downstream after a dead closure is re-anchored", async () => {
+    const nativeSink: string[] = [];
+    await withScope(fakeFetch(nativeSink), async ({ scope }) => {
+        scope.open();
+        Object.defineProperty(globalThis.fetch, "__piWebAccessProxyFetch", { value: true });
+        let respawns = 0;
+        installNativeFetchIntercept({
+            origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+            respawn: async () => { respawns++; return undefined; },
+        });
+        const top = globalThis.fetch;
+        assert.equal(Reflect.get(top, "__piWebAccessProxyFetch"), true);
+        scope.close();
+        await top("https://api.example.invalid/v1/messages", { method: "POST" });
+        assert.notEqual(Reflect.get(top, "__piWebAccessProxyFetch"), true);
+        const web = webAccessProxy();
+        web.install();
+        assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+        assert.equal(web.installs, 1);
+        assert.equal(respawns, 0);
+    });
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
 });

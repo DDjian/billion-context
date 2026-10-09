@@ -85,6 +85,29 @@ function stripLoopThinking(messages: CoreMessage[]): CoreMessage[] {
     return messages.filter((m) => !isLoopThinking(m));
 }
 
+// #2501: evidence that this upstream SIGNS thinking blocks — the client's
+// replayed request carries signed thinking in an assistant message (clients of
+// a signing upstream persist every signed block and replay it verbatim; that
+// replay is exactly what turns a missing signature into a 400). Scans the RAW
+// client body, not ctx.messages: folded/compressed views may have dropped the
+// old assistant turns long before the incident window, while the client always
+// re-sends its full persisted history.
+function bodyHasSignedThinking(body: Record<string, unknown>): boolean {
+    const messages = body.messages;
+    if (!Array.isArray(messages)) return false;
+    for (const m of messages) {
+        if (!m || typeof m !== "object" || (m as Record<string, unknown>).role !== "assistant") continue;
+        const content = (m as Record<string, unknown>).content;
+        if (!Array.isArray(content)) continue;
+        for (const item of content) {
+            if (!item || typeof item !== "object" || (item as Record<string, unknown>).type !== "thinking") continue;
+            const sig = (item as Record<string, unknown>).signature;
+            if (typeof sig === "string" && sig.length > 0) return true;
+        }
+    }
+    return false;
+}
+
 // #1960: Anthropic's "cannot be modified" 400 means the latest assistant
 // message we sent differs from its own original response in a thinking-family
 // block. The degraded strip-retry cannot undo that — the message is still
@@ -230,7 +253,11 @@ export type ParsedStreamEvent =
     // may emit it again with no client-visible effect, so it must not bar the
     // #413 blind re-fetch (a ping-only truncated round was otherwise locked
     // out of the retry by "any forwarded byte").
-    | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean; stateless?: boolean };
+    // #2501: thinkingStart marks the release of a held anthropic thinking
+    // content_block_start — from this moment the block exists in the CLIENT'S
+    // stream until its signature_delta arrives, so a truncation before the
+    // signature bars every re-fetch on a signing upstream (see the gates).
+    | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean; stateless?: boolean; thinkingStart?: boolean };
 
 export interface EmitCompletionOpts {
     finishReason?: string;
@@ -465,6 +492,11 @@ export async function* runCompressLoop(
     // keys must survive into it (later rounds win on key collision).
     let terminalExtra: Record<string, unknown> | undefined;
 
+    // #2501: history-side evidence that this upstream signs thinking blocks —
+    // computed once; the per-attempt side (a signature_delta seen while
+    // streaming) is tracked with the other attempt state below.
+    const historyHasSignedThinking = bodyHasSignedThinking(requestBody);
+
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
@@ -494,6 +526,12 @@ export async function* runCompressLoop(
             // round-2 truncation out of this retry path.
             let forwardedFraming = false;
             let forwardedVisible = false;
+            // #2501: a thinking block reached the client without its signature —
+            // unrecoverable by re-fetch on a signing upstream (see the gates).
+            // Set when the held start is released (adapter's thinkingStart meta),
+            // cleared when that block's signature_delta is forwarded.
+            let unsignedThinkingOnWire = false;
+            let sawSignedThinkingThisAttempt = false;
             let fwdBytes = 0;
             const fwd = (chunk: Buffer, visible = false, stateless = false): Buffer => {
                 fwdBytes += chunk.length;
@@ -536,6 +574,8 @@ export async function* runCompressLoop(
                 sawThinking = false;
                 forwardedFraming = false;
                 forwardedVisible = false;
+                unsignedThinkingOnWire = false;
+                sawSignedThinkingThisAttempt = false;
                 fwdBytes = 0;
 
                 for await (const ev of adapter.parseStream(currentUpstream, round)) {
@@ -562,7 +602,14 @@ export async function* runCompressLoop(
                             reasoningSealed = false;
                         }
                         seg.text += ev.delta;
-                        if (ev.signature) seg.signature += ev.signature;
+                        if (ev.signature) {
+                            seg.signature += ev.signature;
+                            // #2501: the open thinking block just got its signature —
+                            // it is valid client history again, and its presence is
+                            // in-attempt evidence that this upstream signs.
+                            unsignedThinkingOnWire = false;
+                            sawSignedThinkingThisAttempt = true;
+                        }
                         if (ev.blockEnd) reasoningSealed = true;
                         if (!ctx.textProtocol) {
                             if (ev.raw) {
@@ -599,7 +646,11 @@ export async function* runCompressLoop(
                 } else if (ev.kind === "diag") {
                     ctx.log(ev.message);
                     if (ev.level === "warn") loggerLog("warn", `[${ctx.session.id}] ${ev.message}`);
-                } else if (ev.kind === "meta") {
+                    } else if (ev.kind === "meta") {
+                        // #2501: track the client-wire state regardless of whether
+                        // this round forwards the frame — the gate reads it after
+                        // the attempt ends, not per forwarded byte.
+                        if (ev.thinkingStart) unsignedThinkingOnWire = true;
                         if (round === 1 || !ev.firstRoundOnly) {
                             yield fwd(ev.chunk, false, ev.stateless === true);
                         }
@@ -617,6 +668,21 @@ export async function* runCompressLoop(
                     ctx.log(`[acp-loop] round ${round}: upstream stream error: ${streamError}`);
                     loggerLog("warn", `[acp-loop] upstream stream error: ${streamError}`);
                 }
+
+                // #2501: a thinking block already forwarded to the client WITHOUT its
+                // signature can never be made valid by a re-fetch — closing it (resume
+                // or error path) leaves an INVALID block in the client's persisted
+                // history; the next replay is rejected ("thinking.signature: Field
+                // required") and Claude Code then strips ALL prior thinking from the
+                // session forever. On a signing upstream (history or in-attempt
+                // evidence) refuse BOTH re-fetch shapes and fall through to the
+                // truncation error below: the client discards the whole failed attempt
+                // instead of persisting the poisoned block. Unsigned relays — no
+                // evidence either way — keep the #1455 behavior intact.
+                const unsignedThinkingBarsRefetch =
+                    ctx.protocol === "anthropic" &&
+                    unsignedThinkingOnWire &&
+                    (historyHasSignedThinking || sawSignedThinkingThisAttempt);
 
                 // #413: zero-side-effect truncation — re-fetching the same round is
                 // invisible to the client in two shapes:
@@ -637,7 +703,10 @@ export async function* runCompressLoop(
                 //     forwarding state rather than round number, so a re-fetched stream
                 //     cannot emit a second response identity, and parseStream closes the
                 //     dead attempt's still-open blocks before resuming, so no dangling
-                //     content_block_start survives. responses/google keep shape (a) only:
+                //     content_block_start survives. The THIRD anthropic hazard — an
+                //     unsigned thinking block already on the client wire — is barred
+                //     out of this gate by unsignedThinkingBarsRefetch (#2501).
+                //     responses/google keep shape (a) only:
                 //     their item-lifecycle identity frames (response.created — #440's
                 //     single-created invariant) have no equivalent dedup here.
                 // One retry per request; 200+early-EOF flakiness (common on relays) no
@@ -651,7 +720,8 @@ export async function* runCompressLoop(
                     calls.length === 0 &&
                     !(ctx.textProtocol && assistantText.length > 0) &&
                     !signal?.aborted &&
-                    !truncationRetried
+                    !truncationRetried &&
+                    !unsignedThinkingBarsRefetch
                 ) {
                     truncationRetried = true;
                     ctx.log(`[acp-loop] round ${round}: upstream truncated with no visible output reaching the client; retrying fetch once`);
@@ -703,7 +773,10 @@ export async function* runCompressLoop(
                     assistantText.length > 0 &&
                     calls.length === 0 &&
                     !signal?.aborted &&
-                    !continuationRetried
+                    !continuationRetried &&
+                    // #2501: text before the open thinking block — same poisoned-block
+                    // hazard as the blind shape; refuse and fall through to the error.
+                    !unsignedThinkingBarsRefetch
                 ) {
                     continuationRetried = true;
                     const tail = assistantText.length <= TRUNCATION_CONTINUATION_TAIL_CHARS

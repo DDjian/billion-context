@@ -42,7 +42,7 @@ import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
-import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
@@ -1166,7 +1166,8 @@ export function apply(ctx: PluginContext): void {
         if (target !== undefined) {
             const cached = modelInfo.byKey.get(modelInfoKey(target.provider, target.model));
             if (cached !== undefined) {
-                headers["x-bili-plugin-model"] = cached.model;
+                const modelHeader = asciiHeaderValue(cached.model);
+                if (modelHeader !== undefined) headers["x-bili-plugin-model"] = modelHeader;
                 if (cached.contextWindow !== undefined) headers["x-bili-plugin-context-window"] = String(cached.contextWindow);
                 if (cached.maxOutput !== undefined) headers["x-bili-plugin-max-output"] = String(cached.maxOutput);
             }

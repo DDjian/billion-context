@@ -13,7 +13,7 @@ import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
-import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 
 export type Ctx = {
@@ -970,7 +970,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     // maxTokens lives on the model object when configured.
                     const modelId = ctx.model?.id;
                     if (typeof modelId === "string" && modelId.length > 0) {
-                        headers["x-bili-plugin-model"] = modelId;
+                        const modelHeader = asciiHeaderValue(modelId);
+                        if (modelHeader !== undefined) headers["x-bili-plugin-model"] = modelHeader;
                         const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
                         if (typeof maxOut === "number" && Number.isFinite(maxOut) && maxOut > 0) headers["x-bili-plugin-max-output"] = String(Math.floor(maxOut));
                         reportRuntimeInfoOnChange(proxyBase, { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });

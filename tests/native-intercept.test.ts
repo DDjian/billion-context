@@ -13,6 +13,14 @@ test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://localhost:9123/v1/messages/"), true);
 });
 
+test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
+    assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
 test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/models"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:36485/__bili/plugin/manifest"), false);
@@ -22,6 +30,12 @@ test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("file:///tmp/v1/messages"), false);
     assert.equal(isModelApiUrl("not a url"), false);
     assert.equal(isModelApiUrl("https://api.anthropic.com/v1/messages/count_tokens"), false);
+    // Google wire: only the three methods the proxy core prepares count.
+    // Model listing, unprepared methods (:predict) and case drift stay direct.
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:predict"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:generatecontent"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:18787/bili/http://127.0.0.1:8317/v1beta/models/m:generateContent"), false);
 });
 
 function fakeFetch(sink: string[]) {
@@ -88,6 +102,31 @@ test("install: rewrites model URLs once ready", async () => {
         assert.equal(res.status, 200);
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("install: rewrites Google-wire model URLs through the proxy (#2493)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40006", ready: Promise.resolve("http://127.0.0.1:40006") };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40006/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"]);
+});
+
+test("install: already-routed Google-wire /bili/ request gets plugin headers re-stamped (#2493)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40007",
+        ready: Promise.resolve("http://127.0.0.1:40007"),
+        headersFor: () => ({ "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "session-g" }),
+    };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:40007/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:40007/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse");
+    assert.equal(sink[0].headers["x-bili-plugin"], "dsh");
+    assert.equal(sink[0].headers["x-bili-plugin-conversation"], "session-g");
 });
 
 test("install: waits for a not-yet-ready proxy before rewriting", async () => {
@@ -475,6 +514,11 @@ test("routedBiliModelUrl: extracts the embedded model URL from /bili/ form", asy
     const { routedBiliModelUrl } = await import("../src/agent/native-intercept.ts");
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"), "http://127.0.0.1:8199/v1/messages");
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages?beta=1"), "https://api.anthropic.com/v1/messages?beta=1");
+    // Google-wire embedded target (#2493): header re-stamping applies too.
+    assert.equal(
+        routedBiliModelUrl("http://127.0.0.1:40001/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"),
+        "http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse",
+    );
     // non-model embedded targets and plugin endpoints do not count
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/bili/https://registry.npmjs.org/pkg"), undefined);
     assert.equal(routedBiliModelUrl("http://127.0.0.1:40001/__bili/plugin/manifest"), undefined);
@@ -736,6 +780,70 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
         assert.equal(calls[2], "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages");
         assert.deepEqual(dispatches, ["self", "retry", "retry"]);
         assert.equal(respawns, 1);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+// #2496: a network blip against a ROUTED /bili/ URL whose recovery lands back
+// on the SAME origin used to be treated as give-up — the request went direct
+// AND onGiveUp fired (omp/pi lanes delete BILLION_CONTEXT_PROXY there, right
+// after bootstrap republished it), so the proxy variable stayed unset for the
+// whole host process even though the proxy never died.
+test("install: routed /bili/ transient failure recovering to the same origin retries there, no give-up (#2496)", async () => {
+    const calls: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let failures = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (url.startsWith("http://127.0.0.1:40001/") && failures < 1) {
+            failures += 1;
+            throw new TypeError("fetch failed");
+        }
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    let respawns = 0;
+    let giveUps = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        attach: true,
+        respawn: () => {
+            respawns += 1;
+            // The attached proxy is still healthy — recovery lands on the SAME origin.
+            state.origin = "http://127.0.0.1:40001";
+            state.ready = Promise.resolve("http://127.0.0.1:40001");
+            return Promise.resolve("http://127.0.0.1:40001");
+        },
+        onGiveUp: () => {
+            giveUps += 1;
+        },
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+        assert.deepEqual(calls, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        ]);
+        assert.deepEqual(dispatches, ["self", "retry"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 0, "same-origin recovery is not a loss — onGiveUp must not fire");
+        assert.equal(state.origin, "http://127.0.0.1:40001");
+        // The baked URL stays valid as-is — no replaced-origin record, so the
+        // next request goes straight through without another reroute.
+        const res2 = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res2.status, 200);
+        assert.equal(calls[2], "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(dispatches, ["self", "retry", "self"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 0);
     } finally {
         globalThis.fetch = saved;
         _resetForTest();

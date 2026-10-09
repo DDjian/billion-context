@@ -87,6 +87,12 @@ function inferWireProtocol(path: string): "openai" | "responses" | "google" | nu
 function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string, est: number): void {
     const s = prepared.session;
     if (!Number.isFinite(est) || est <= 0) return;
+    // An upstream-proven ceiling (overflow-arm) plus its route-origin evidence
+    // must never be demoted by a local payload estimate: demoting it back to
+    // "estimate" drops baselineFloorRaw below the probe threshold and re-fires
+    // the forward-probe loop every turn (#2484). usage→estimate overwrite stays
+    // the intended #604 behavior for generic failures with no overflow marker.
+    if (s.stats.lastInputTokensSource === "overflow-arm") return;
     if (est > s.stats.lastInputTokens) {
         s.stats.lastInputTokens = est;
         s.stats.lastInputTokensSource = "estimate";
@@ -832,11 +838,11 @@ export async function forward(
         }
         // #604: relay/gateway 5xx — no usage report will arrive, so arm the
         // emergency shrink with a local estimate of the wire body we just sent
-        // (see armFailureShrink for the deadlock this breaks). Generic relay
-        // errors (new_api_error etc.) are not overflow signatures and carry no
-        // window number, so this is the only self-heal path for them;
-        // inspectContextOverflow never matches 5xx (400/413 only), so the
-        // overflow path above could not have handled this response.
+        // (see armFailureShrink for the deadlock this breaks). A generic relay
+        // error carries no overflow marker or window number, so this is its only
+        // self-heal path; a 5xx whose body DOES match an overflow marker was
+        // already armed by the overflow path above, and armFailureShrink's
+        // overflow-arm guard keeps this estimate from demoting that ceiling (#2484).
         if (prepared?.session && upstream.status >= 500) {
             armFailureShrink(prepared, log, `upstream ${upstream.status}`, outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         }
@@ -1285,7 +1291,7 @@ export async function forward(
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
             const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, absorbActive);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
