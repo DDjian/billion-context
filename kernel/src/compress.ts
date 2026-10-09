@@ -1817,16 +1817,16 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // threshold AND exceeds the effective pending of every lower tier (T2 > T1
   // effective; T3 > T2 and > T1 effective). Per-tier thresholds (#2376):
   // nudge.tierGrowthTokens.{t1,t2,t3} may pin each mass trigger independently;
-   // each unset tier keeps its derived default (T1 = growth step, T2/T3 = the
-   // shared multiplier threshold), so absent config decides byte-identically.
-   // On the growth path a count-ready tier is NEVER short-circuited behind a
-   // ready T1 (#509): slots alternate — T1 keeps first pick until it has gone
-   // (nudge.lastInjectedTier), then the count-ready tier with the oldest
-   // cadence stamp wins (never-shown = oldest; tie -> lower tier) — so an
-   // explicitly lowered trigger is heard in sessions whose raw pending stays
-   // high, and neither side starves even if the model keeps ignoring or
-   // complying with one of them.
-   const tier2Threshold = Math.round(
+  // each unset tier keeps its derived default (T1 = growth step, T2/T3 = the
+  // shared multiplier threshold), so absent config decides byte-identically.
+  // On the growth path a count-ready tier is NEVER short-circuited behind a
+  // ready T1 (#509): slots alternate — T1 keeps first pick until it has gone
+  // (nudge.lastInjectedTier), then the count-ready tier with the oldest
+  // cadence stamp wins (never-shown = oldest; tie -> lower tier) — so an
+  // explicitly lowered trigger is heard in sessions whose raw pending stays
+  // high, and neither side starves even if the model keeps ignoring or
+  // complying with one of them.
+  const tier2Threshold = Math.round(
     nudgeGrowthTokens * (config.nudge.tier2GrowthMultiplier ?? 1.5),
   );
   const tierThresholds: Record<CompressionTier, number> = {
