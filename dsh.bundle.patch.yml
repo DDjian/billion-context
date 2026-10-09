@@ -2,6 +2,12 @@
 # Mounted automatically when the profile's package.json lists billion-context
 # in dsh.profile.bundles (`dsh plugin --profile <name> add billion-context`);
 # the loader resolves `name` from the profile's node_modules.
+# #1772/#2474: the `auto: false` below targets the HOST-PLANE compaction-basic
+# row. In profiles bundling @deepseek-ai/dsh-web-app that row is disabled and
+# the running instance lives inside the preset-standard entry, which this
+# bundle layer cannot address by id — switching off auto-compaction there
+# needs a profile-level full-snapshot override of preset-standard (config
+# replaces wholesale; see the plugin's boot warning / #2474).
 - insert:
     - id: bili-native
       name: billion-context

@@ -4944,15 +4944,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         } else if (allowDshCompactionState(process.env).enabled !== true) {
             // #2360 §3: native install owns the plugin chain — the overlay patch
             // above would insert a SECOND bili-native entry and hard-fail dsh
-            // boot, and DSH mounts compaction in the agent preset's group where
-            // a profile-level dsh.bundle.patch.yml cannot reach it either
-            // (#1772/#2360) — so compaction-basic auto:false is NOT in force and
-            // dsh native compaction stays armed. Say so at launch instead of
-            // leaving the user to discover a landed checkpoint through
-            // destroyed-substrate errors; the live protection is the proxy's
-            // wire-level refusal on every lane (openai/anthropic/responses).
+            // boot, and DSH mounts compaction in an agent preset whose nested
+            // rows no patch layer can address by id (#1772/#2360) — so
+            // compaction-basic auto:false is NOT in force unless the user
+            // applies the #2474 full-snapshot override of preset-standard in
+            // their profile's cordis.patch.yml, and dsh native compaction
+            // stays armed otherwise. Say so at launch instead of leaving the
+            // user to discover a landed checkpoint through destroyed-substrate
+            // errors; the live protection is the proxy's wire-level refusal on
+            // every lane (openai/anthropic/responses).
             console.error(
-                "bili: dsh native install detected — the launcher's compaction-basic auto:false overlay patch is skipped (a second bili-native entry would hard-fail dsh boot), and DSH mounts compaction in the agent preset where profile patches cannot reach it (#1772/#2360): dsh native compaction stays ARMED. Protection is bili's wire-level refusal of dsh compaction calls on all lanes (openai/anthropic/responses, #1729/#2193/#2360) — if you see 'compression substrate appears destroyed' or chained 'compress FAILED' errors, a dsh checkpoint has landed outside bili's knowledge.",
+                "bili: dsh native install detected — the launcher's compaction-basic auto:false overlay patch is skipped (a second bili-native entry would hard-fail dsh boot), and DSH mounts compaction in an agent preset whose nested rows no patch layer can address by id (#1772/#2360): dsh native compaction stays ARMED unless you apply the #2474 full-snapshot override of the preset-standard row in your profile's cordis.patch.yml (config replaces wholesale — see the plugin's boot warning for the exact recipe). Protection is bili's wire-level refusal of dsh compaction calls on all lanes (openai/anthropic/responses, #1729/#2193/#2360) — if you see 'compression substrate appears destroyed' or chained 'compress FAILED' errors, a dsh checkpoint has landed outside bili's knowledge.",
             );
         }
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);

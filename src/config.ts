@@ -893,8 +893,10 @@ export type ProxyOptions = {
      *  substrate, which is why this stays off by default. On non-web
      *  profiles the shipped bundle patch (`auto: false`) still suppresses
      *  AUTO-triggering — only manual /compact benefits there; on web
-     *  profiles (where no patch layer reaches the preset-nested instance,
-     *  #1772) auto-triggering works as-is. Enable with
+     *  profiles the preset-nested instance is not reachable by id from any
+     *  bundle patch (#1772), but a profile-layer full-snapshot override of
+     *  preset-standard can switch it off (#2474); absent that,
+     *  auto-triggering works as-is. Enable with
      *  `{ "dsh": { "allowDshCompaction": true } }` in the config file, or env
      *  BILI_ALLOW_DSH_COMPACTION=1. */
     allowDshCompaction?: boolean;
