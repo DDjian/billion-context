@@ -300,11 +300,15 @@ function parseOverflowWindow(text: string): number | undefined {
 }
 
 /** Inspect an upstream response for a context-overflow error. `status` is the
- *  HTTP status; `bodyText` is the (usually small) error body. Only 400/413 with
- *  a recognized context-too-long marker counts. */
+ *  HTTP status; `bodyText` is the (usually small) error body. 400/413 and any
+ *  5xx are checked against the recognized context-too-long markers; the marker
+ *  match is the real gate, so a generic server error (no marker) never counts.
+ *  5xx is included because some gateways relay the model provider's overflow
+ *  rejection under 502/503 rather than 400 (#2484). */
 export function inspectContextOverflow(status: number, bodyText: string): ContextOverflowInfo {
     const message = (bodyText ?? "").slice(0, 300);
-    if (status !== 400 && status !== 413) return { isOverflow: false, message };
+    const plausible = status === 400 || status === 413 || status >= 500;
+    if (!plausible) return { isOverflow: false, message };
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
     if (!isOverflow) return { isOverflow: false, message };

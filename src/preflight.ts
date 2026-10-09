@@ -21,6 +21,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import type { ExternalSummaryBatchResult } from "./external-summary.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 
 // #247: proactive pre-forward compression. When the session's real context
@@ -869,6 +870,20 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
+/** Describe why an external-summary batch yielded no usable summary (#2484):
+ *  the batch stop reason plus each candidate attempt's outcome, so an operator
+ *  can tell timeout / error / cancelled / invalid-plan apart instead of seeing
+ *  one opaque "failed or exceeded their budget" line. */
+export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult): string {
+    if (batch.status === "failed") return `batch=failed reason=${batch.reason}`;
+    const result = batch.results[0];
+    if (!result) return `batch=${batch.status} (no result)`;
+    const parts = [`batch=${batch.status}`, `result=${result.status}`];
+    if (result.status === "failed") parts.push(`reason=${result.reason}`);
+    parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}`).join(",")}]`);
+    return parts.join(" ");
+}
+
 async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number): Promise<SummaryOutcome> {
     // #1775: the cap used to be enforced only after the fact — an over-cap
     // assembly was discarded wholesale (the #1775 incident). Tell the model the
@@ -886,7 +901,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
             maxSummaryChars: deps.config.compress.maxSummaryLength }], deps.signal);
         const result = batch.results[0];
         return result?.status === "success" ? { summary: result.summary }
-            : { unusable: "configured external summary candidates failed or exceeded their budget", transient: false };
+            : { unusable: describeExternalSummaryFailure(batch), transient: false };
     }
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with

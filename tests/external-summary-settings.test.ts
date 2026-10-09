@@ -86,7 +86,7 @@ for (const invalid of [
     { enabled: true, targets: [{}] }, { enabled: true, targets: ["glm"] },
     { enabled: true, targets: ["glm/"] }, { enabled: true, targets: ["/flash"] },
     { enabled: true, targets: ["glm/glm-4.9-flash\n"] },
-    { enabled: true, budget: { totalTimeoutMs: 60_000 } },
+    { enabled: true, budget: { totalTimeoutMs: 700_000 } },
     { enabled: true, budget: { totalTimeoutMs: 100, targetTimeoutMs: 101 } },
     { enabled: true, budget: { concurrency: 1000 } },
     { enabled: true, targets: Array.from({ length: 17 }, () => "glm/glm-4.9-flash") },
@@ -96,6 +96,13 @@ for (const invalid of [
         assert.equal(parseCompressSettings({ externalSummary: invalid }), undefined);
     });
 }
+
+test("totalTimeoutMs accepts the widened cap and rejects above it (#2484)", () => {
+    // A big-session fold runs a dozen or more chunks against one shared
+    // deadline, so the cap was raised from 50s to 600s; the default stays 50s.
+    assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { totalTimeoutMs: 600_000 } }));
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { totalTimeoutMs: 600_001 } }));
+});
 
 for (const invalid of [
     "unknown/glm-4.9-flash", "glm/unknown-model",
