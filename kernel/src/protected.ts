@@ -182,8 +182,12 @@ export function matchToolMessagePattern(
 
 export function isMessageProtected(
   msg: CoreMessage,
-  config: Pick<Config, "protectedTools" | "isToolProtected">,
+  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected">,
 ): boolean {
+  // Host-declared message-level protection (#2419): applies to ANY content
+  // type and outranks everything below — the host owns the decision.
+  if (config.isMessageProtected?.(msg)) return true;
+
   // tool-result carries the same toolName as its tool-call (the host projects
   // it), so checking toolName covers both sides of a tool exchange.
   if (

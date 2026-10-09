@@ -14,6 +14,7 @@ import { codexAlignedWindow } from "../codex-models.js";
 import { MAX_REQUEST_BYTES } from "../fetch-util.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
+import { durableMessageGuards } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -1730,7 +1731,15 @@ export async function handle(
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
         // render from the values the kernel actually used this turn.
+        // #2419: per-lane durable-state message guard (KDD#9 evidence-permitlist).
+        // Stamp the CLONE-SAFE config first — a function inside
+        // session.metadata.effectiveConfig would break fork-adoption structuredClone
+        // and disk persistence — then attach it to this turn's reqConfig so
+        // processTurn protects the message now. effectiveConfig() re-resolves the
+        // guard from the lane id at read time, so /__bili/plugin/tool sees it too.
         storeEffectiveConfig(session, reqConfig);
+        const durableGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
+        if (durableGuard !== undefined) reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.

@@ -388,6 +388,21 @@ export interface Config {
   compress: CompressValidationConfig;
   protectedTools: string[];
   isToolProtected?: (toolName: string, toolInputText?: string) => boolean;
+  /** Host-declared message-level hard protection (billion-context#2419):
+   *  when set, ANY message for which the predicate returns true is excluded
+   *  from compression exactly like a protectedTools hit — BLOCKED ref in
+   *  assignRefs (never advertised, never foldable-by-ref) AND dropped from
+   *  effectiveMessageIds in applyCompression (stays fully visible; the
+   *  summary reflects only what was actually folded). Applies to every
+   *  content type; the tool-exchange checks below run additionally, not
+   *  instead. Use for host-injected DURABLE STATE carried as ordinary
+   *  conversation messages — e.g. dsh's skill catalog, which DSH
+   *  fingerprint-gates (sha256 over name+description) and never resends
+   *  while unchanged, so folding it loses skill visibility permanently.
+   *  Unset = byte-identical behavior to before (only tool exchanges and
+   *  media payloads are protectable). Must be pure and cheap: it runs once
+   *  per message per turn. */
+  isMessageProtected?: (msg: CoreMessage) => boolean;
   /** Tool-name patterns (glob suffix allowed) protected in their LATEST
    *  instance only: the newest matching tool-call and its paired tool-result
    *  are protected from compression; older instances remain compressible. For
