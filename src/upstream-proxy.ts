@@ -172,7 +172,20 @@ function parseFallbackProxy(proxy: string | undefined, biliPort?: number): Parse
     }
 }
 
-export function matchesNoProxy(target: URL, noProxy: string | undefined): boolean {
+type NoProxyOptions = {
+    /** Windows ProxyOverride grammar (#2502): mid-token `*` entries (Clash's default
+     *  bypass list is `localhost;127.*;192.168.*;…;<local>`) glob-match the hostname —
+     *  `.` stays literal, `*` matches any characters. NO_PROXY lists keep their
+     *  conventional grammar where `*` only appears as a standalone item. */
+    windowsBypass?: boolean;
+};
+
+function wildcardHostMatch(host: string, token: string): boolean {
+    const pattern = "^" + token.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$";
+    return new RegExp(pattern).test(host);
+}
+
+export function matchesNoProxy(target: URL, noProxy: string | undefined, options: NoProxyOptions = {}): boolean {
     if (!noProxy) return false;
     const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
     const port = target.port ? Number.parseInt(target.port, 10) : defaultPort(target.protocol);
@@ -196,6 +209,7 @@ export function matchesNoProxy(target: URL, noProxy: string | undefined): boolea
             }
         }
         if (tokenPort !== undefined && tokenPort !== port) continue;
+        if (options.windowsBypass && !token.startsWith("*") && token.includes("*") && wildcardHostMatch(host, token)) return true;
         const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
         if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
     }
@@ -290,7 +304,7 @@ export function resolveProxyDecision(
         if (scheme) warnUnsupportedScheme(source, value, scheme);
     }
     const system = fallback.systemProxy ?? readWindowsSystemProxy();
-    if (target && matchesNoProxy(target, system.bypass)) {
+    if (target && matchesNoProxy(target, system.bypass, { windowsBypass: true })) {
         return { source: "windows-bypass", ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}) };
     }
     const systemValue = target?.protocol === "http:" ? system.http : system.https ?? system.http;
