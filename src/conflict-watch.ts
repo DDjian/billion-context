@@ -121,7 +121,7 @@ function isNeutralEvent(e: ConflictEvent): boolean {
     return e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail));
 }
 
-export function isConfirmedConflictEvent(e: ConflictEvent): boolean {
+function isConfirmedConflictEvent(e: ConflictEvent): boolean {
     if (e.kind === "native-compaction") return true;
     if (e.kind !== "third-party-plugin") return false;
     return !isNeutralEvent(e) && !isSuspectedEvent(e);

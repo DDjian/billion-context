@@ -68,7 +68,7 @@ export function isDesignBenign(finding: ThirdPartyFinding, pluginAgent: string |
  *  (not record time) also covers stock ledgers written by older versions before
  *  any of these tags existed. Non-plugin detail shapes (unannounced-rewrite /
  *  orphan-reap / native-compaction) never match. */
-export interface ParsedPluginConflictDetail {
+interface ParsedPluginConflictDetail {
     client: string;
     entry: string;
     source: string;
