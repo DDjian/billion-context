@@ -63,6 +63,7 @@ export async function prepareAnthropic(
     let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let anthropicCacheMarks: Map<string, { type: "ephemeral" }> | undefined;
+    let clientCacheControls: Map<string, unknown> | undefined;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
 
@@ -233,6 +234,11 @@ export async function prepareAnthropic(
         anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
             ? undefined
             : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
+        // #2499: hand the round-2 adapter the SAME marks source the steady path
+        // uses — `anthropicCacheMarks ?? cacheControls`. The client's harvested
+        // map is the fallback the rebuild applies when bili adds no marks of its
+        // own (a client-managed session), so its trigger-turn breakpoint survives.
+        clientCacheControls = cacheControls;
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], anthropicCacheMarks ?? cacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
@@ -346,7 +352,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 

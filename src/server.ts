@@ -1128,6 +1128,13 @@ export type Prepared = {
      *  rate_limit_error "Error" (#2189). See extractBillingAttributionBlock. */
     anthropicBillingBlock?: { type: "text"; text: string };
     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>;
+    /** #2499: the client's own harvested message-level cache_control breakpoints
+     *  (keyed by content-hash id), returned verbatim by the steady path. The
+     *  round-2 rebuild applies `anthropicCacheMarks ?? anthropicClientCacheControls`
+     *  exactly like the steady path — a client-managed session (no bili marks)
+     *  must re-stamp its own breakpoint on the trigger turn or the post-fold
+     *  prefix is never written to the prefix cache. */
+    anthropicClientCacheControls?: Map<string, unknown>;
     /** Original leading system/developer prefix text captured by the kernel's
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
      *  rebuilt payload and compress-loop round must re-inject it. */
