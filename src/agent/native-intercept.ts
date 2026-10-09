@@ -215,10 +215,14 @@ function nextLiveAnchor(dead: typeof globalThis.fetch): typeof globalThis.fetch 
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
-// `/v1/chat/completions`|`/v1/conversations`. Version segment is optional
-// and unpinned (zhipuai uses `/v4/chat/completions`, bailian mounts
+// `/v1/chat/completions`|`/v1/conversations`, Google native
+// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`
+// — exactly the three methods the proxy core's googlePathKind prepares
+// (#2493; other Google methods such as `:predict` have no pipeline and must
+// keep passing through direct). Version segment is optional and unpinned
+// (zhipuai uses `/v4/chat/completions`, bailian mounts
 // `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$/;
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
