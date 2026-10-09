@@ -21,11 +21,67 @@ export const SIDE_REQUEST_MAX_TOKENS = 200;
 // Persona ids whose requests are side requests by intent (#1699). Main personas
 // (build/plan/general/...) are deliberately absent — they are real turns.
 export const SIDE_REQUEST_AGENTS: ReadonlySet<string> = new Set(["title"]);
+
+// #2500: Anthropic server-executed tool types are versioned by date and the
+// client NEVER executes them — a request whose ENTIRE tool surface is these
+// types is a host-internal utility call (Claude Code's WebSearch sub-request,
+// sent under the main session id), not an agent turn. The dated suffix is
+// load-bearing: client-executed versioned tools (bash_20250124, text_editor_*,
+// computer_*) must keep their sessions on the main pipeline, and unversioned
+// client tools carry no matching type at all.
+const SERVER_EXECUTED_TOOL_TYPES = /^(?:web_search|web_fetch)_\d{8}$/;
+
+/** #2500: structural identification of a server-tool-only utility call.
+ *  Decisive conditions (all must hold):
+ *   - exactly ONE message (a forced-search turn replaying conversation history
+ *     is a real main turn — the model may be asked to search mid-conversation);
+ *   - non-empty tools where EVERY entry's type matches a server-executed
+ *     web_search_/web_fetch_ version — mixing ANY client-side tool (including
+ *     leaked bili tools) vetoes;
+ *   - tool_choice absent or auto/any (string or object form); forcing
+ *     {type:"tool",name} is allowed only for a DECLARED tool (Claude Code's
+ *     thinking-off source shape forces {type:"tool",name:"web_search"});
+ *     "none" or any unrecognized shape vetoes.
+ *  Deliberately proto-safe by shape alone: OpenAI entries are type "function",
+ *  the Responses wire uses `input` and unversioned types, Google uses
+ *  functionDeclarations — none can match. */
+export function isServerToolUtilityCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    const messages = p.messages;
+    if (!Array.isArray(messages) || messages.length !== 1) return false;
+    const tools = p.tools;
+    if (!Array.isArray(tools) || tools.length === 0) return false;
+    const declared = new Set<string>();
+    for (const t of tools) {
+        if (t === null || typeof t !== "object") return false;
+        const type = (t as { type?: unknown }).type;
+        if (typeof type !== "string" || !SERVER_EXECUTED_TOOL_TYPES.test(type)) return false;
+        const name = (t as { name?: unknown }).name;
+        if (typeof name === "string" && name.length > 0) declared.add(name);
+    }
+    const choice = p.tool_choice;
+    if (choice === undefined) return true;
+    if (choice === "auto" || choice === "any") return true;
+    if (choice !== null && typeof choice === "object") {
+        const c = choice as { type?: unknown; name?: unknown };
+        if (c.type === "auto" || c.type === "any") return true;
+        if (c.type === "tool" && typeof c.name === "string" && declared.has(c.name)) return true;
+    }
+    return false;
+}
+
 export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
     if (requestAgent === "main") return false;
     const p = parsed as Record<string, unknown>;
+    // #2500: BEFORE the #546 rule — a server-tool-only utility call carries
+    // non-empty tools but is not an agent turn. Routed through the #388 side
+    // passthrough so its usage (often far above its own tiny context) can
+    // never re-anchor the main session's nudge baseline (#1595) and nothing
+    // gets injected into it. Explicit host intent above still outranks this.
+    if (isServerToolUtilityCall(p)) return true;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
     const field = outputBudgetField(parsed);
     if (!field) return false;
@@ -68,6 +124,9 @@ export interface SideLaneSignals {
     stripApplied: boolean;
     sideIntent: boolean;
     requestAgent: string | undefined;
+    // #2500: caller-supplied label for a structurally identified side request
+    // (the max_tokens<=200 fallback string below cannot describe it).
+    sideLabel?: string;
 }
 export type SideLaneDecision = { lane: "side" | "main"; demoted: boolean; reason: string };
 // The #388 lane decision. `demoted` ⊆ `lane === "side"`. No fork input can
@@ -81,7 +140,8 @@ export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
         return { lane: "side", demoted: true, reason: "leaked bili tools stripped (#1897)" };
     }
     if (s.sideIntent) {
-        return { lane: "side", demoted: false, reason: s.requestAgent !== undefined ? `agent=${s.requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}` };
+        const reason = s.sideLabel ?? (s.requestAgent !== undefined ? `agent=${s.requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`);
+        return { lane: "side", demoted: false, reason };
     }
     return { lane: "main", demoted: false, reason: "main turn" };
 }
