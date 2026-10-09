@@ -451,6 +451,47 @@ export function withStagedCompressGuidance(text: string): string {
     return text + STAGED_COMPRESS_GUIDANCE;
 }
 
+// #2326 first-sight mass digestion. When a host hands bili a pre-inflated
+// history (dsh plugin mode after its own digestion, CLI hand-off, resumed
+// rollout), the first requests see a large ready mass with zero growth
+// baseline: the kernel marks those nudges " [first-sight mass]" and re-arms
+// after every SUCCESSFUL fold, so the backlog gets folded one small call per
+// request. Each front-positioned fold rewrites the request prefix, so every
+// piecemeal landing re-pays the ENTIRE remaining tail to the prefix cache —
+// measured 2.29x/tok re-pay for a 5-fold cascade vs 0.032x/tok for one big
+// fold (issue log: eb985b31 vs 5c5c26d1, ~70x). This note tells the model,
+// at the moment of the nudge, that the ranges are a pre-existing backlog to
+// drain in ONE batched call — split oversized spans into multiple ranges at
+// logical boundaries (each under its per-summary cap, per the budget note
+// above) but submit them ALL together in the same call — instead of piecemeal
+// front folds. It deliberately REPLACES withStagedCompressGuidance during
+// digestion: the smooth-transition note (smaller, tail-biased, keep the
+// prefix intact) is exactly wrong for a backlog that must be drained. The
+// closing precedence sentence keeps it correct on #2228 decide-directive
+// injections, whose stock text pins ONE span. Byte-stable constants (like
+// the notes above) so the prefix-cache anchor stays intact.
+const FIRST_SIGHT_DRAIN_NOTE =
+    "\n\n[First-sight digestion: the compressible ranges above are a pre-existing backlog this session arrived with, not growth from your current task. Drain the backlog in ONE batched compress call — cover EVERY ready range, splitting oversized spans into multiple smaller ranges at logical boundaries (each summary within its cap), and submit them all together in the same call (content: [{startId,endId,summary}, {…}]). Do NOT fold piecemeal across turns: every small front fold re-bills the whole remaining tail to the prefix cache, while one batched call lands once. Keep draining while the nudge repeats — it stops when the backlog is gone. Where this conflicts with a single-span directive above, this takes precedence: the cited span is the starting point of the batch, not its limit.]";
+const FIRST_SIGHT_DRAIN_NOTE_EXTERNAL =
+    "\n\n[First-sight digestion: the compressible ranges above are a pre-existing backlog this session arrived with, not growth from your current task. The independent summary service writes the summaries — you only select the ranges (plus optional topic hints), so your own response-length budget is not a limit here. Drain the backlog in ONE batched compress call — cover EVERY ready range, splitting oversized spans into multiple smaller ranges at logical boundaries, and submit them all together in the same call (content: [{startId,endId,summary}, {…}]). Do NOT fold piecemeal across turns: every small front fold re-bills the whole remaining tail to the prefix cache, while one batched call lands once. Keep draining while the nudge repeats — it stops when the backlog is gone. Where this conflicts with a single-span directive above, this takes precedence: the cited span is the starting point of the batch, not its limit.]";
+
+/** True when the kernel flagged the nudge reason with the first-sight mass
+ *  marker (kernel/src/compress.ts appends " [first-sight mass]" while a
+ *  pre-inflated backlog is still being digested — the marker re-rides every
+ *  re-armed nudge until the mass drops below the growth floor). */
+export function firstSightDrainActive(reason: string | undefined): boolean {
+    return reason !== undefined && reason.includes("[first-sight mass]");
+}
+
+/** Nudge range guidance, first-sight aware (#2326): during first-sight mass
+ *  digestion append the batched-drain note (and drop the smooth-transition
+ *  note, which would steer the opposite direction); otherwise behave exactly
+ *  like withStagedCompressGuidance. */
+export function withFirstSightDrain(text: string, reason: string | undefined, external: boolean): string {
+    if (!firstSightDrainActive(reason)) return withStagedCompressGuidance(text);
+    return text + (external ? FIRST_SIGHT_DRAIN_NOTE_EXTERNAL : FIRST_SIGHT_DRAIN_NOTE);
+}
+
 // #717 anti-forgery rule for ACP confirmation markers. Under sustained
 // context pressure a model was observed writing the proxy's own marker format
 // ("📦 [ACP] Compressed …") as plain assistant text — 17 fake compressions,
