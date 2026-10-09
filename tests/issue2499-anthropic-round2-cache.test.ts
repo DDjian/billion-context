@@ -89,8 +89,9 @@ async function startHarness(): Promise<Harness> {
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             captured.push(Buffer.concat(chunks).toString("utf8"));
-            // The client sends exactly three single-block turns → refs m00001..m00003.
-            // Fold the first two (A, B); the marked trigger turn C (m00003) survives.
+            // The client sends seven single-block turns → refs m00001..m00007.
+            // Fold the first two (m00001..m00002); the marked trigger turn
+            // (m00007, the most recent user message) survives the fold.
             const sse = call === 0 ? compressSse("m00001", "m00002") : TEXT_SSE;
             call += 1;
             res.writeHead(200, { "content-type": "text/event-stream" });
