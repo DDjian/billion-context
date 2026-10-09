@@ -742,6 +742,70 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
     }
 });
 
+// #2496: a network blip against a ROUTED /bili/ URL whose recovery lands back
+// on the SAME origin used to be treated as give-up — the request went direct
+// AND onGiveUp fired (omp/pi lanes delete BILLION_CONTEXT_PROXY there, right
+// after bootstrap republished it), so the proxy variable stayed unset for the
+// whole host process even though the proxy never died.
+test("install: routed /bili/ transient failure recovering to the same origin retries there, no give-up (#2496)", async () => {
+    const calls: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let failures = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (url.startsWith("http://127.0.0.1:40001/") && failures < 1) {
+            failures += 1;
+            throw new TypeError("fetch failed");
+        }
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    let respawns = 0;
+    let giveUps = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        attach: true,
+        respawn: () => {
+            respawns += 1;
+            // The attached proxy is still healthy — recovery lands on the SAME origin.
+            state.origin = "http://127.0.0.1:40001";
+            state.ready = Promise.resolve("http://127.0.0.1:40001");
+            return Promise.resolve("http://127.0.0.1:40001");
+        },
+        onGiveUp: () => {
+            giveUps += 1;
+        },
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+        assert.deepEqual(calls, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        ]);
+        assert.deepEqual(dispatches, ["self", "retry"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 0, "same-origin recovery is not a loss — onGiveUp must not fire");
+        assert.equal(state.origin, "http://127.0.0.1:40001");
+        // The baked URL stays valid as-is — no replaced-origin record, so the
+        // next request goes straight through without another reroute.
+        const res2 = await globalThis.fetch("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res2.status, 200);
+        assert.equal(calls[2], "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(dispatches, ["self", "retry", "self"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 0);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("install: routed /bili/ request with no respawn degrades to a direct send (#1130)", async () => {
     const calls: string[] = [];
     const dispatches: string[] = [];
